@@ -165,6 +165,25 @@ describe('the herdr runtime as an adapter', () => {
     ]);
   });
 
+  it.each([
+    ['a deadline', { deadline: Date.now() - 60_000 }],
+    ['a cancellation signal', { signal: AbortSignal.abort() }],
+    ['both at once', { deadline: Date.now() - 60_000, signal: AbortSignal.abort() }],
+  ])('cannot be given %s to hold for its whole life', async (_label, smuggled) => {
+    // `Omit` is checked where a caller writes an object literal, and nowhere else. This is the
+    // path it does not cover: a wider object, or a JavaScript caller, carrying the fields anyway.
+    const script = herdr(recorded('workspace-create', 'success'), renamed('w2:p1', 'pipeline-run'));
+    const wider = { run: script.run, session: 'pipeline_test', ...smuggled };
+    // No cast: a variable is not a fresh literal, so structural typing accepts it as it stands.
+    // That it compiles at all is the point — which is why the filtering has to be at runtime.
+    const runtime = createHerdrRuntime({ herdr: wider });
+
+    // A spent deadline or an aborted signal reaching the CLI would end this before it began; the
+    // layout completing is what says neither did.
+    await expect(runtime.createLayout(workspace)).resolves.toBe('w2:p1');
+    expect(script.verbs()).toEqual(['workspace create', 'pane rename']);
+  });
+
   it('refuses a layout after shutdown, before invoking anything', async () => {
     const script = herdr();
     const runtime = createHerdrRuntime({ herdr: { run: script.run } });

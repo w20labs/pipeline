@@ -28,13 +28,20 @@ export type HerdrRuntime = Pick<
 
 /**
  * Explicit rather than the two internal option bags, so the public surface says exactly what a
- * caller may set. There is deliberately no cancellation signal here: the adapter's `createLayout`
- * takes none, so a constructor-level one would cancel every layout call at once, and
- * {@link HerdrRuntime.shutdown} already provides the cancellation there is.
+ * caller may set.
+ *
+ * Neither a deadline nor a cancellation signal belongs here, and both are refused. A runtime is
+ * built once and used many times, while {@link HerdrOptions.deadline} is one absolute instant and
+ * {@link HerdrOptions.signal} one cancellation: held at this level they would bound not a call but
+ * every call the runtime ever makes, expiring partway through a session that was going fine.
+ *
+ * Bounding is therefore the caller's: a caller that stops waiting stops waiting, and that is all it
+ * does. Ending the work is {@link HerdrRuntime.shutdown}, which cancels this runtime's in-flight
+ * CLI children — and only those.
  */
 export interface HerdrRuntimeOptions {
-  /** How the herdr CLI is invoked for layout work. */
-  readonly herdr?: Omit<HerdrOptions, 'signal'>;
+  /** How the herdr CLI is invoked for layout work. Bounding and cancellation are not settings. */
+  readonly herdr?: Omit<HerdrOptions, 'signal' | 'deadline'>;
   /** The shell that interprets a gate's command. Defaults to `/bin/sh`. */
   readonly shell?: string;
   /** Raw bytes across both of a gate's streams before its result is refused rather than truncated. */
@@ -48,6 +55,21 @@ export interface HerdrRuntimeOptions {
 export function createHerdrRuntime(options: HerdrRuntimeOptions = {}): HerdrRuntime {
   // The gate fields sit at the top level of the options, so they pass straight through.
   const runner = createGateRunner(options);
+  /**
+   * What actually reaches the CLI.
+   *
+   * `Omit` is a claim the compiler checks at one call site and nowhere else: a wider object
+   * assigned to this parameter keeps its extra properties, and a JavaScript caller was never
+   * checked at all. Both are removed here, so no path through this runtime can impose either.
+   * A denylist rather than a list of what to keep, so a field added to `HerdrOptions` later is
+   * forwarded rather than silently dropped.
+   */
+  const forwarded = ((): Omit<HerdrOptions, 'signal' | 'deadline'> => {
+    const copy: Record<string, unknown> = { ...options.herdr };
+    delete copy['deadline'];
+    delete copy['signal'];
+    return copy as Omit<HerdrOptions, 'signal' | 'deadline'>;
+  })();
   /**
    * Layout work runs herdr CLI children that belong to this adapter. Shutdown ends *those*, and
    * nothing else: the herdr server, the panes and workspaces already created, the agents in them
@@ -74,7 +96,7 @@ export function createHerdrRuntime(options: HerdrRuntimeOptions = {}): HerdrRunt
       inFlight.add(ending);
       void ending.then(() => inFlight.delete(ending));
 
-      const work = createLayout(spec, { ...options.herdr, signal: own.signal });
+      const work = createLayout(spec, { ...forwarded, signal: own.signal });
       // Followed through a separate settlement, so knowing when the call ends neither handles the
       // caller's rejection for them nor alters it: `work` is returned exactly as it came.
       void work.then(ended, ended);
