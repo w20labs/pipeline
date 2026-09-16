@@ -48,7 +48,11 @@ export class LayoutError extends Error {
 }
 
 /** Read one string out of a nested payload object, or nothing if it is not there. */
-const optional = (envelope: HerdrEnvelope, key: string, field: string): string | undefined => {
+export const optional = (
+  envelope: HerdrEnvelope,
+  key: string,
+  field: string,
+): string | undefined => {
   const holder = envelope.result[key];
   const value =
     typeof holder === 'object' && holder !== null
@@ -57,7 +61,7 @@ const optional = (envelope: HerdrEnvelope, key: string, field: string): string |
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 };
 
-const nested = (
+export const nested = (
   envelope: HerdrEnvelope,
   argv: readonly string[],
   key: string,
@@ -73,7 +77,11 @@ const nested = (
  * Each command answers with its own event type. Accepting any envelope would let one command's
  * answer stand in for another's, so the type is checked before anything is read out of it.
  */
-const expectType = (envelope: HerdrEnvelope, argv: readonly string[], type: string): void => {
+export const expectType = (
+  envelope: HerdrEnvelope,
+  argv: readonly string[],
+  type: string,
+): void => {
   if (envelope.result.type !== type)
     throw new HerdrError('malformed', argv, `answered ${envelope.result.type}, not ${type}`);
 };

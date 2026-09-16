@@ -77,7 +77,14 @@ export interface AgentHandle {
  */
 export type LaunchResult =
   | { readonly kind: 'ready'; readonly agent: AgentHandle }
-  /** The agent exists and is addressable, but is waiting at a startup dialog and cannot be prompted. */
+  /**
+   * The agent exists and is addressable, but its readiness is not established and it cannot be
+   * prompted. A startup dialog is the common case; a state that is simply not promptable — busy,
+   * or reported as unknown — arrives here too, with `detail` saying which was observed.
+   *
+   * The finer distinction is {@link inspectAgent}'s: {@link AgentInspection} separates a dialog
+   * from working from undetermined, and is the recovery path for deciding what to do next.
+   */
   | { readonly kind: 'not_ready'; readonly agent: AgentHandle; readonly detail: string }
   /** Readiness could not be established before the deadline. Whether anything launched is unknown. */
   | { readonly kind: 'startup_unconfirmed'; readonly pane: PaneId; readonly detail: string };

@@ -422,8 +422,14 @@ is a later concern, and must not put the exit status back at risk.
 ### Step 12 — HerdrRuntime: agents
 **Depends on:** 11 · **Files:** `packages/runtime/src/herdr/agent.ts`
 
-**Build:** `launchAgent`, `promptAgent`, and `readAgentOutput` using herdr's agent state. The
-read window is sized from the step 04 findings.
+**Build:** `launchAgent`, `inspectAgent`, `promptAgent`, `observeAgentTurn` and `readAgentOutput`
+using herdr's agent state. The read window is sized from the step 04 findings.
+
+**Correction.** This line previously named three of the five. `observeAgentTurn` is required by this
+step's own "Done when" — settled, blocked and timeout are turn *observations* — and the skeleton
+engine already calls it; `inspectAgent` is the recovery path a `startup_unconfirmed` launch depends
+on, so a launch without it is unusable. Both belong here. Step 31 still owns the fake agent and its
+end-to-end runs through real herdr, and step 32 the live agent CLIs.
 
 **Done when:**
 - Unit tests on fixtures cover settled, blocked, and timeout, and reading a long output.
