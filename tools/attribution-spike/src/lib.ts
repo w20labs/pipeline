@@ -222,3 +222,111 @@ export const mayRepeat = (): { readonly allowed: false; readonly why: string } =
   allowed: false,
   why: 'no completion signal tied to a submission has been established yet',
 });
+/**
+ * The absolute bound every wait in this run answers to.
+ *
+ * herdr's own `--timeout` bounds the command it is given; it does not bound a child that never
+ * closes, nor the reads around it, nor startup, nor cleanup. Cleanup's share is reserved from the
+ * start, so the run cannot spend its way out of being able to tidy up.
+ */
+export class Budget {
+  constructor(
+    private readonly startedAt: number,
+    private readonly totalMs: number,
+    private readonly cleanupMs: number,
+  ) {}
+  /** What work may still take, holding the cleanup reserve back. */
+  forWork(now: number): number {
+    return Math.max(0, this.startedAt + this.totalMs - this.cleanupMs - now);
+  }
+  /** What cleanup may take: its reserve, plus anything work did not spend. */
+  forCleanup(now: number): number {
+    return Math.max(0, this.startedAt + this.totalMs - now);
+  }
+  spent(now: number): boolean {
+    return this.forWork(now) <= 0;
+  }
+}
+
+/** A deadline miss is a fact about the run, so it is named rather than thrown away. */
+export class Overran extends Error {
+  constructor(
+    readonly label: string,
+    readonly afterMs: number,
+  ) {
+    super(`${label} did not finish within ${afterMs}ms`);
+    this.name = 'Overran';
+  }
+}
+
+/**
+ * Bound one wait. Whatever it was waiting on keeps running; only the waiting ends.
+ *
+ * The deadline is an instant, computed on entry, and the clock decides — not the timer. A timer
+ * callback only runs once the event loop is free, so a loop blocked past the deadline lets the
+ * work's own callback arrive first and a race on callbacks alone would accept it: a 20ms budget
+ * accepting success at 80ms. Nothing can preempt a blocked loop, but once it resumes this reports
+ * what actually happened.
+ */
+export const within = <T>(work: Promise<T>, label: string, ms: number): Promise<T> => {
+  // A budget already spent is not a race to lose, and an already-resolved promise must not win it.
+  // The work was created by the caller and keeps running regardless, so its eventual rejection
+  // still needs a handler: without one, abandoning the wait here would crash the process with an
+  // unhandled rejection before any cleanup ran. It is observed and discarded, never reported.
+  if (ms <= 0) {
+    work.catch(() => undefined);
+    return Promise.reject(new Overran(label, ms));
+  }
+  const deadline = Date.now() + ms;
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    work.then((value) => {
+      if (Date.now() >= deadline) throw new Overran(label, ms);
+      return value;
+    }),
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Overran(label, ms)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+};
+
+/**
+ * When each sample is due, measured from the instant the prompt's child actually closed.
+ *
+ * The first harness slept, then read, then called that "settled" — so a child that closed at 50 ms
+ * was recorded as settling at 1,700 ms, and every later offset carried the accumulated cost of the
+ * reads before it. Targets are absolute and computed once, from a closure timestamp taken inside
+ * the close callback itself.
+ */
+export const sampleTargets = (closedAt: number, offsets: readonly number[]): number[] =>
+  offsets.map((offset) => closedAt + offset);
+
+export interface Timed {
+  readonly offset: number;
+  /** When this sample should have started. */
+  readonly targetAt: number;
+  readonly startedAt: number;
+  readonly endedAt: number;
+  /** How late it actually started. A sample at +0 that starts at +900 measures something else. */
+  readonly missedByMs: number;
+  /** How long the read itself took, which the next target must not silently absorb. */
+  readonly tookMs: number;
+}
+
+export const timedSample = (
+  offset: number,
+  targetAt: number,
+  startedAt: number,
+  endedAt: number,
+): Timed => ({
+  offset,
+  targetAt,
+  startedAt,
+  endedAt,
+  missedByMs: Math.max(0, startedAt - targetAt),
+  tookMs: endedAt - startedAt,
+});
+
+/** How long to wait before a target, never negative and never past what the budget allows. */
+export const dueIn = (targetAt: number, now: number, budget: number): number =>
+  Math.max(0, Math.min(targetAt - now, budget));
