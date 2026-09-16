@@ -1,0 +1,8 @@
+command: herdr --session pipeline_04b_startup_84671_4dd4b6 agent start startup_check --kind claude --pane w1:p1 --timeout 45000 -- --model sonnet --restricted --strict-mcp-config --tools Read,Glob,Grep
+exit: 0
+elapsed_ms: 3962
+herdr: 0.9.0
+claude: 2.1.272
+session: pipeline_04b_startup_84671_4dd4b6 (isolated headless server, no other agents)
+config: a fresh, empty CLAUDE_CONFIG_DIR; no prompt sent, no dialog answered
+screen: onboarding-idle-ready.screen, read with `pane read --source visible` 20107 ms AFTER this command returned, not at the same moment

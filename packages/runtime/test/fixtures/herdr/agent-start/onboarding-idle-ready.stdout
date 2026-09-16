@@ -1,0 +1,2 @@
+{"id":"cli:agent:start","result":{"agent":{"agent":"claude","agent_status":"idle","cwd":"/Users/aantonyan/.cache/pipeline-04b-scratch","focused":true,"foreground_cwd":"/Users/aantonyan/.cache/pipeline-04b-scratch","interactive_ready":true,"name":"startup_check","pane_id":"w1:p1","revision":0,"state_change_seq":1,"tab_id":"w1:t1","terminal_id":"term_65ba0f584f8211","workspace_id":"w1"},"argv":["claude","--model","sonnet","--restricted","--strict-mcp-config","--tools","Read,Glob,Grep"],"type":"agent_started"}}
+

@@ -122,12 +122,15 @@ export async function launchAgent(
     const kind = nested(started, argv, 'agent', 'agent');
     if (kind !== resolved.kind) mismatch('a', kind, `kind ${resolved.kind}`);
 
-    // Nor does it establish readiness. herdr reports the state it observed, and `idle` or `done`
-    // with `interactive_ready` is the only pair that means this agent can take a prompt now.
+    // Nor does it establish readiness, and no value of these fields does. `idle` with
+    // `interactive_ready` was recorded both for an agent that could take a prompt and for one whose
+    // pane was later seen at its first-run onboarding screen
+    // (test/fixtures/herdr/agent-start/onboarding-idle-ready.*). A signal that cannot tell those
+    // apart cannot establish either, so a start is reported `not_ready` whatever herdr says. Both
+    // fields are still validated, and still reported, because they are evidence.
     //
     // Checked as the types they are declared to be, never coerced: `String(["idle"])` is `"idle"`,
-    // so a coercion would read a malformed answer as a promptable agent. A field of the wrong type
-    // is malformed; a well-formed state that simply cannot take a prompt is `not_ready`.
+    // and a malformed answer is refused rather than described.
     const agent = started.result['agent'] as Record<string, unknown>;
     const status = agent['agent_status'];
     const interactive = agent['interactive_ready'];
@@ -139,13 +142,14 @@ export async function launchAgent(
         argv,
         'the result carries no agent.interactive_ready boolean',
       );
-    if (!(interactive && (status === 'idle' || status === 'done')))
-      return {
-        kind: 'not_ready',
-        agent: { pane, name: registered },
-        detail: `herdr reports ${status}${interactive ? '' : ', not interactive-ready'}`,
-      };
-    return { kind: 'ready', agent: { pane, name: registered } };
+    const settled = interactive && (status === 'idle' || status === 'done');
+    return {
+      kind: 'not_ready',
+      agent: { pane, name: registered },
+      detail: settled
+        ? `herdr reports ${status} and interactive-ready, which is not sufficient to establish readiness to take a prompt`
+        : `herdr reports ${status}${interactive ? '' : ', not interactive-ready'}`,
+    };
   } catch (cause) {
     const failure = cause as HerdrError;
     // A dialog is a real, addressable state: the agent exists and is named in herdr's message, but
@@ -175,9 +179,10 @@ export async function launchAgent(
  * `agent` tells them apart (docs/herdr-notes.md, Q4). Nothing here concludes a pane is idle or free
  * to reuse — `no_agent` means no agent was recognised, and something may well be running.
  *
- * `pane get` carries no `interactive_ready`, so readiness rests on the reported status alone. That
- * is weaker than {@link launchAgent}'s evidence, which is why this is an inspection and not a
- * launch.
+ * `pane get` carries no `interactive_ready`, and its status alone is weaker evidence than
+ * {@link launchAgent}'s — which is itself not sufficient to establish readiness. So a settled status
+ * is `state_unknown`, never `ready`: the agent is recognised and the pane is fine, and whether it
+ * can take a prompt is not established.
  */
 export async function inspectAgent(
   pane: PaneId,
@@ -233,7 +238,11 @@ export async function inspectAgent(
   switch (status) {
     case 'idle':
     case 'done':
-      return { kind: 'ready', agent };
+      return {
+        kind: 'state_unknown',
+        agent,
+        detail: `herdr reports ${status}, which is not sufficient to establish readiness to take a prompt`,
+      };
     case 'working':
       return { kind: 'working', agent };
     case 'blocked':

@@ -221,6 +221,29 @@ that something occupies the shell.
 - Bad kind: [`agent-start/error-invalid-kind.*`](../packages/runtime/test/fixtures/herdr/agent-start/) → exit 2, plain text.
 - Missing pane: [`agent-start/error-pane-not-found.*`](../packages/runtime/test/fixtures/herdr/agent-start/) → exit 1, `agent_pane_not_found`.
 
+**A settled, interactive-ready start is not established readiness.** One recorded start
+([`agent-start/onboarding-idle-ready.*`](../packages/runtime/test/fixtures/herdr/agent-start/))
+returned exit 0 with `agent_status: "idle"` and `interactive_ready: true` — the same values as
+`success-extra-args`, where the agent could take a prompt. That pane's visible screen was then read
+and showed Claude Code's first-run onboarding (a theme picker), which cannot take one.
+
+What this establishes, and what it does not:
+
+- The two answers carry identical readiness fields for different situations, so these fields are
+  **insufficient to establish readiness to take a prompt**. The runtime reports `not_ready` from
+  `agent start` and `state_unknown` from inspection rather than inferring `ready`.
+- The screen was read **about 20 seconds after** `agent start` returned (20107 ms), not at the same
+  moment. The config directory was fresh and empty, so onboarding was very likely already showing,
+  but the capture does not prove the two observations coincide.
+- It is **one** observation, of Claude Code 2.1.272 on herdr 0.9.0 under a fresh configuration. It
+  does not show that every startup, or any other agent, reports readiness this way.
+
+That run was a startup-only check: one launch with a private `CLAUDE_CONFIG_DIR`, no prompt and no
+dialog answered. **Configuration relocation confirmed**: Claude wrote `.claude.json`, a backup,
+its cache and a `sessions/` key into the private directory, and the real `~/.claude/projects` gained
+nothing. **Transcript relocation unverified**: no transcript appeared, which is expected when no
+conversation starts, so the check could not show where one would be written.
+
 ### `agent prompt --wait`
 
 ```

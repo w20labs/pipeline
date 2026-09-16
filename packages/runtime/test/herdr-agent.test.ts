@@ -93,7 +93,8 @@ describe('resolving a profile to an agent kind', () => {
     const s = script(started((agent) => (agent['agent'] = kind)));
     const result = await launchAgent(PANE, profile, LATER(), { run: s.run });
     expect(flagOf(s.calls[0] as string[], '--kind')).toBe(kind);
-    expect(result).toMatchObject({ kind: 'ready' });
+    // the identity is accepted; readiness is a separate question, and herdr cannot settle it
+    expect(result).toMatchObject({ kind: 'not_ready', agent: { name: NAME } });
   });
 
   it.each(['not-a-profile', 'constructor', 'toString', '__proto__', 'hasOwnProperty'])(
@@ -131,7 +132,7 @@ describe('launching an agent', () => {
   it('reports the agent herdr registered, in the pane it was asked for', async () => {
     const s = script(started());
     const result = await launchAgent(PANE, 'claude-code', LATER(), { run: s.run });
-    expect(result).toEqual({ kind: 'ready', agent: { pane: PANE, name: NAME } });
+    expect(result).toMatchObject({ kind: 'not_ready', agent: { pane: PANE, name: NAME } });
     const argv = s.calls[0] as string[];
     expect(argv.slice(0, 3)).toEqual(['agent', 'start', NAME]); // named after its pane
     expect(flagOf(argv, '--pane')).toBe(PANE); // and the pane is named, never left to focus
@@ -220,12 +221,43 @@ describe('launching an agent', () => {
     expect(error.message).toMatch(expected);
   });
 
-  it('accepts a start that settled as done rather than idle', async () => {
-    // both are ordinary settled states for a started agent; neither alone is a defect
-    const s = script(started((agent) => (agent['agent_status'] = 'done')));
-    expect(await launchAgent(PANE, 'claude-code', LATER(), { run: s.run })).toMatchObject({
-      kind: 'ready',
+  it.each(['idle', 'done'])(
+    'does not call a start ready when herdr reports %s and interactive-ready',
+    async (status) => {
+      // pinned for both settled values, so neither can quietly be restored to `ready`
+      const s = script(started((agent) => (agent['agent_status'] = status)));
+      const result = await launchAgent(PANE, 'claude-code', LATER(), { run: s.run });
+      expect(result).toEqual({
+        kind: 'not_ready',
+        agent: { pane: PANE, name: NAME }, // the registered name is kept
+        detail: `herdr reports ${status} and interactive-ready, which is not sufficient to establish readiness to take a prompt`,
+      });
+    },
+  );
+
+  it('gives the same answer for a recorded start that was ready and one later seen at onboarding', async () => {
+    // Two real recordings. In one the agent could take a prompt; in the other its pane was read,
+    // about 20 seconds after this answer, showing first-run onboarding. Their readiness fields are
+    // identical — so those fields cannot establish readiness for either, and neither is `ready`.
+    const readyish = recorded('agent-start', 'success-extra-args');
+    const onboarding = recorded('agent-start', 'onboarding-idle-ready');
+    const fields = (stdout: string) => {
+      const agent = (JSON.parse(stdout) as { result: { agent: Record<string, unknown> } }).result
+        .agent;
+      return { status: agent['agent_status'], interactive: agent['interactive_ready'] };
+    };
+    expect(fields(onboarding.stdout)).toEqual(fields(readyish.stdout));
+
+    const wasReady = await launchAgent('w1:p2' as PaneId, 'claude-code', LATER(), {
+      run: script(readyish).run,
+      nameFor: () => 'spike_impl',
     });
+    const atOnboarding = await launchAgent('w1:p1' as PaneId, 'claude-code', LATER(), {
+      run: script(onboarding).run,
+      nameFor: () => 'startup_check',
+    });
+    expect(wasReady).toMatchObject({ kind: 'not_ready', agent: { name: 'spike_impl' } });
+    expect(atOnboarding).toMatchObject({ kind: 'not_ready', agent: { name: 'startup_check' } });
   });
 
   it('reports an agent blocked at a startup dialog, and answers nothing', async () => {
@@ -355,17 +387,23 @@ describe('inspecting a pane', () => {
     };
   };
 
-  it('adopts a pane holding a ready agent, with no registered name', async () => {
-    // the recording as taken: a launch whose startup timed out, and the agent is there after all
+  it('adopts a pane holding a settled agent, with no registered name, without calling it ready', async () => {
+    // the recording as taken: a launch whose startup timed out, and the agent is there after all —
+    // addressable by pane, but a settled status does not establish that it can take a prompt
     const s = script(paneGet());
     const result = await inspectAgent(PANE, LATER(), undefined, { run: s.run });
-    expect(result).toEqual({ kind: 'ready', agent: { pane: PANE } });
+    expect(result).toEqual({
+      kind: 'state_unknown',
+      agent: { pane: PANE },
+      detail: 'herdr reports idle, which is not sufficient to establish readiness to take a prompt',
+    });
     expect(result).not.toHaveProperty('agent.name'); // pane get reports a kind, not a name
     expect(s.calls[0]).toEqual(['pane', 'get', PANE]);
   });
 
   it.each([
-    ['done', 'ready'],
+    ['idle', 'state_unknown'], // both settled values pinned, so neither can drift back to ready
+    ['done', 'state_unknown'],
     ['working', 'working'],
     ['blocked', 'not_ready'],
     ['unknown', 'state_unknown'],

@@ -460,6 +460,11 @@ engine already calls it; `inspectAgent` is the recovery path a `startup_unconfir
 on, so a launch without it is unusable. Both belong here. Step 31 still owns the fake agent and its
 end-to-end runs through real herdr, and step 32 the live agent CLIs.
 
+**Unresolved prerequisite — readiness.** herdr's reported agent state does not establish that an
+agent can take a prompt (`docs/herdr-notes.md`, "agent start"), so `launchAgent` and `inspectAgent`
+never return `ready` from it. Until a signal that does establish readiness is identified, nothing
+here can prompt an agent, and `promptAgent` onward (12b) cannot assume one.
+
 **Done when:**
 - Unit tests on fixtures cover settled, blocked, and timeout, and reading a long output.
 

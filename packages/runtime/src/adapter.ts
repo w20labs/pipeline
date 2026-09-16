@@ -76,6 +76,11 @@ export interface AgentHandle {
  * adopt whatever is there. The adapter MUST NOT answer a startup dialog or relaunch on its own.
  */
 export type LaunchResult =
+  /**
+   * Readiness to take a prompt has been **established**. A lifecycle status reported by the
+   * underlying runtime is not, on its own, sufficient: an implementation that cannot establish
+   * readiness reports `not_ready` rather than inferring it.
+   */
   | { readonly kind: 'ready'; readonly agent: AgentHandle }
   /**
    * The agent exists and is addressable, but its readiness is not established and it cannot be
@@ -101,6 +106,11 @@ export type LaunchResult =
  * to conclude the pane is idle, free to reuse, or that a previously launched agent has exited.
  */
 export type AgentInspection =
+  /**
+   * Readiness to take a prompt has been **established**, on the same terms as
+   * {@link LaunchResult} `ready`. An implementation that cannot establish it reports
+   * `state_unknown` rather than inferring readiness from a reported status.
+   */
   | { readonly kind: 'ready'; readonly agent: AgentHandle }
   /** An agent is there but waiting at a dialog. Re-inspect after the operator answers it. */
   | { readonly kind: 'not_ready'; readonly agent: AgentHandle; readonly detail: string }
