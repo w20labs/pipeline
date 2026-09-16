@@ -4,7 +4,12 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { PaneId } from '../src/adapter.js';
-import { DEFAULT_PROFILES, launchAgent, type ProfileResolver } from '../src/herdr/agent.js';
+import {
+  DEFAULT_PROFILES,
+  inspectAgent,
+  launchAgent,
+  type ProfileResolver,
+} from '../src/herdr/agent.js';
 import { HerdrError, type HerdrRunner } from '../src/herdr/cli.js';
 
 const recorded = (group: string, name: string) => {
@@ -319,5 +324,223 @@ describe('bounding a startup', () => {
     const s = script(started());
     await launchAgent(PANE, 'claude-code', Date.now() + 5_000, { run: s.run });
     expect(s.calls).toHaveLength(1);
+  });
+});
+
+type R = Record<string, unknown>;
+
+describe('inspecting a pane', () => {
+  /**
+   * A `pane get` answer built from a real recording.
+   *
+   * The base is `agent-start/timeout-after-state` — an actual `herdr pane get w1:p2` taken right
+   * after a startup timeout, which is exactly the recovery this inspection exists for. Anything a
+   * case changes is a *synthetic* variation and is named as such in that case.
+   */
+  const paneGet = (
+    change: (pane: Record<string, unknown>, result: Record<string, unknown>) => void = () => {},
+  ) => {
+    const ok = recorded('agent-start', 'timeout-after-state');
+    const doc = JSON.parse(ok.stdout) as { result: Record<string, unknown> };
+    change(doc.result['pane'] as Record<string, unknown>, doc.result);
+    return { ...ok, stdout: JSON.stringify(doc) };
+  };
+
+  /** A `pane get` failure, adapted from the recorded `pane read` one: the code is what matters. */
+  const paneNotFound = () => {
+    const recordedRead = recorded('pane-read', 'error-bad-pane');
+    return {
+      ...recordedRead,
+      stderr: recordedRead.stderr.replace('cli:pane:read', 'cli:pane:get'),
+    };
+  };
+
+  it('adopts a pane holding a ready agent, with no registered name', async () => {
+    // the recording as taken: a launch whose startup timed out, and the agent is there after all
+    const s = script(paneGet());
+    const result = await inspectAgent(PANE, LATER(), undefined, { run: s.run });
+    expect(result).toEqual({ kind: 'ready', agent: { pane: PANE } });
+    expect(result).not.toHaveProperty('agent.name'); // pane get reports a kind, not a name
+    expect(s.calls[0]).toEqual(['pane', 'get', PANE]);
+  });
+
+  it.each([
+    ['done', 'ready'],
+    ['working', 'working'],
+    ['blocked', 'not_ready'],
+    ['unknown', 'state_unknown'],
+  ])('reports a synthetic %s status as %s', async (status, kind) => {
+    const s = script(paneGet((pane) => (pane['agent_status'] = status)));
+    const result = await inspectAgent(PANE, LATER(), undefined, { run: s.run });
+    expect(result).toMatchObject({ kind, agent: { pane: PANE } });
+  });
+
+  it('says only that herdr reports a blocked state, inventing no dialog text', async () => {
+    // `pane get` carries no dialog content, so none is reported; reading it is a later concern
+    const s = script(paneGet((pane) => (pane['agent_status'] = 'blocked')));
+    const result = await inspectAgent(PANE, LATER(), undefined, { run: s.run });
+    expect((result as { detail: string }).detail).toBe('herdr reports a blocked state');
+  });
+
+  it('tells an unrecognized process from an agent in an unknown state', async () => {
+    // both recordings report agent_status "unknown"; only the `agent` key separates them
+    const unrecognized = script(recorded('pane-get', 'unrecognized-cli'));
+    const recognised = script(recorded('pane-get', 'known-agent-unknown'));
+    const absent = await inspectAgent('w1:p3' as PaneId, LATER(), undefined, {
+      run: unrecognized.run,
+    });
+    const present = await inspectAgent('w1:p4' as PaneId, LATER(), undefined, {
+      run: recognised.run,
+    });
+
+    expect(absent).toEqual({ kind: 'no_agent', pane: 'w1:p3' });
+    expect(present).toMatchObject({ kind: 'state_unknown', agent: { pane: 'w1:p4' } });
+    // and `no_agent` is never a claim that the pane is idle or free: a node REPL produced it
+    expect(absent).not.toMatchObject({ kind: 'ready' });
+  });
+
+  it('reports a pane herdr does not have as established absence', async () => {
+    const s = script(paneNotFound());
+    expect(await inspectAgent(PANE, LATER(), undefined, { run: s.run })).toEqual({
+      kind: 'unknown_pane',
+      pane: PANE,
+    });
+  });
+
+  it.each([
+    ['an answer of the wrong type', (_p: R, r: R) => (r['type'] = 'agent_info'), /pane_info/],
+    ['an answer with no pane object', (_p: R, r: R) => delete r['pane'], /pane object/],
+    ['an answer about another pane', (p: R) => (p['pane_id'] = 'w9:p9'), /w9:p9/],
+    ['an agent that is null', (p: R) => (p['agent'] = null), /non-empty string/],
+    ['an agent that is empty', (p: R) => (p['agent'] = ''), /non-empty string/],
+    ['an agent that is a number', (p: R) => (p['agent'] = 7), /non-empty string/],
+    ['an agent that is a list', (p: R) => (p['agent'] = ['claude']), /non-empty string/],
+    ['a missing status', (p: R) => delete p['agent_status'], /agent_status string/],
+    ['a status that is a list', (p: R) => (p['agent_status'] = ['idle']), /agent_status string/],
+    ['a status herdr does not report', (p: R) => (p['agent_status'] = 'sleeping'), /sleeping/],
+  ])('refuses %s rather than classifying it', async (_label, change, expected) => {
+    // every one of these is synthetic, and each must be refused before any classification —
+    // `no_agent` included, since that is a claim about this pane
+    const s = script(paneGet(change));
+    const error = await rejection(inspectAgent(PANE, LATER(), undefined, { run: s.run }));
+    expect(error.fault).toBe('malformed');
+    expect(error.message).toMatch(expected);
+  });
+
+  it.each([
+    [
+      'names another pane',
+      (pane: R) => {
+        delete pane['agent'];
+        pane['pane_id'] = 'w9:p9';
+      },
+      /w9:p9/,
+    ],
+    [
+      'carries no pane id at all',
+      (pane: R) => {
+        delete pane['agent'];
+        delete pane['pane_id'];
+      },
+      /not the pane/,
+    ],
+    [
+      'is not a pane_info',
+      (pane: R, result: R) => {
+        delete pane['agent'];
+        result['type'] = 'agent_info';
+      },
+      /pane_info/,
+    ],
+  ])(
+    'refuses an agent-less answer that %s, rather than reporting no_agent',
+    async (_label, change, expected) => {
+      // `no_agent` is a claim about *this* pane, so it may not be made from an answer never
+      // established to be about it. Every validation runs first, absence included.
+      const s = script(paneGet(change));
+      const error = await rejection(inspectAgent(PANE, LATER(), undefined, { run: s.run }));
+      expect(error.fault).toBe('malformed');
+      expect(error.message).toMatch(expected);
+    },
+  );
+
+  it('raises a failure that is not absence, rather than reporting the pane unknown', async () => {
+    const s = script(recorded('agent-start', 'error-invalid-kind')); // exit 2, a usage error
+    const error = await rejection(inspectAgent(PANE, LATER(), undefined, { run: s.run }));
+    expect(error.fault).toBe('usage');
+  });
+
+  it('asks herdr nothing but pane get', async () => {
+    // `agent explain` answers `idle` by default for a pane `pane get` calls unknown. Not asking is
+    // what keeps that default out of readiness; this is the assertion that keeps it that way.
+    const s = script(recorded('pane-get', 'known-agent-unknown'));
+    await inspectAgent('w1:p4' as PaneId, LATER(), undefined, { run: s.run });
+    expect(s.calls).toHaveLength(1);
+    expect(s.calls.map((argv) => argv[0])).toEqual(['pane']);
+  });
+});
+
+describe('bounding an inspection', () => {
+  beforeEach(() => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] }));
+  afterEach(() => vi.useRealTimers());
+
+  /** Never answers, so only the deadline or the signal can end the call. */
+  const neverAnswers: HerdrRunner = (_file, _argv, signal) =>
+    new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+
+  it('stays pending until its deadline, and times out exactly there', async () => {
+    let settled: unknown;
+    void inspectAgent(PANE, Date.now() + 2_000, undefined, { run: neverAnswers }).then(
+      (result) => (settled = result),
+    );
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(settled).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    // a timeout says nothing about what the pane holds — it is not `no_agent` and not `unknown_pane`
+    expect(settled).toEqual({ kind: 'timed_out', pane: PANE });
+  });
+
+  it('is cancelled by a signal that aborts after dispatch, distinctly from a timeout', async () => {
+    const controller = new AbortController();
+    let settled: unknown;
+    void inspectAgent(PANE, Date.now() + 60_000, controller.signal, { run: neverAnswers }).then(
+      (result) => (settled = result),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    expect(settled).toBeUndefined(); // dispatched, and waiting
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toEqual({ kind: 'cancelled', pane: PANE });
+  });
+
+  it.each([
+    [
+      'a caller that already aborted',
+      () => ({ deadline: Date.now() + 60_000, signal: AbortSignal.abort() }),
+      'cancelled',
+    ],
+    [
+      'a deadline already spent',
+      () => ({ deadline: Date.now() - 1, signal: undefined }),
+      'timed_out',
+    ],
+    [
+      'a caller that aborted with its deadline already spent',
+      () => ({ deadline: Date.now() - 1, signal: AbortSignal.abort() }),
+      // the caller gave up first, and that is the more specific fact: a timeout would say the
+      // inspection ran out of time when nobody was waiting on it any longer
+      'cancelled',
+    ],
+  ])('dispatches nothing for %s', async (_label, shape, kind) => {
+    const before = dispatches;
+    const { deadline, signal } = shape() as { deadline: number; signal?: AbortSignal };
+    expect(await inspectAgent(PANE, deadline, signal, { run: refuseToRun })).toEqual({
+      kind,
+      pane: PANE,
+    });
+    expect(dispatches).toBe(before);
   });
 });

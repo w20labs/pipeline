@@ -1,4 +1,4 @@
-import type { DeadlineEpochMs, LaunchResult, PaneId } from '../adapter.js';
+import type { AgentInspection, DeadlineEpochMs, LaunchResult, PaneId } from '../adapter.js';
 import { herdrEnvelope, HerdrError, type HerdrOptions } from './cli.js';
 import { expectType, nested } from './layout.js';
 
@@ -157,5 +157,92 @@ export async function launchAgent(
     if (failure.fault === 'timed_out' || failure.code === 'timeout')
       return { kind: 'startup_unconfirmed', pane, detail: failure.message };
     throw failure;
+  }
+}
+
+/**
+ * What a pane holds, from `pane get` and nothing else.
+ *
+ * **`agent explain` is deliberately not consulted.** Asked about a pane `pane get` reports as
+ * `unknown`, it answers `state: "idle"` with `matched_rule: null` and
+ * `fallback_reason: "default_known_agent_idle_fallback"`
+ * (test/fixtures/herdr/agent-explain/known-agent-unknown.stdout). A default is not an observation,
+ * and readiness manufactured from one would be indistinguishable from the real thing. Not asking
+ * is safer than reading the answer carefully, and it costs one call instead of two.
+ *
+ * **The discriminator is the `agent` key, never the status.** An unrecognized process and a
+ * recognised agent in an unknown state both report `agent_status: "unknown"`; only the presence of
+ * `agent` tells them apart (docs/herdr-notes.md, Q4). Nothing here concludes a pane is idle or free
+ * to reuse — `no_agent` means no agent was recognised, and something may well be running.
+ *
+ * `pane get` carries no `interactive_ready`, so readiness rests on the reported status alone. That
+ * is weaker than {@link launchAgent}'s evidence, which is why this is an inspection and not a
+ * launch.
+ */
+export async function inspectAgent(
+  pane: PaneId,
+  deadline: DeadlineEpochMs,
+  signal?: AbortSignal,
+  options: HerdrOptions = {},
+): Promise<AgentInspection> {
+  const argv = ['pane', 'get', pane];
+  const malformed = (detail: string): never => {
+    throw new HerdrError('malformed', argv, detail);
+  };
+
+  let answer;
+  try {
+    answer = await herdrEnvelope(argv, {
+      ...options,
+      deadline,
+      ...(signal === undefined ? {} : { signal }),
+    });
+  } catch (cause) {
+    const failure = cause as HerdrError;
+    // Established absence, and only that: `agent_not_found` would not do here, because it cannot
+    // tell a pane with no agent from a pane that does not exist.
+    if (failure.code === 'pane_not_found') return { kind: 'unknown_pane', pane };
+    // Neither of these claims anything about what the pane holds.
+    if (failure.fault === 'timed_out') return { kind: 'timed_out', pane };
+    if (failure.fault === 'cancelled') return { kind: 'cancelled', pane };
+    throw failure;
+  }
+
+  // Everything is validated before anything is classified — including `no_agent`, which is a
+  // claim about this pane and may not be made from an answer about another.
+  expectType(answer, argv, 'pane_info');
+  const held = answer.result['pane'];
+  if (typeof held !== 'object' || held === null || Array.isArray(held))
+    malformed('the result carries no pane object');
+  const reported = held as Record<string, unknown>;
+  if (reported['pane_id'] !== pane)
+    malformed(`answered about ${String(reported['pane_id'])}, not the pane ${pane} it was given`);
+
+  // Absent means no agent was recognised. Present and unusable — null, empty, or not a string — is
+  // a malformed answer, not an absence, and must not be read as one.
+  if (!('agent' in reported)) return { kind: 'no_agent', pane };
+  const recognised = reported['agent'];
+  if (typeof recognised !== 'string' || recognised.length === 0)
+    malformed('agent is present but is not a non-empty string');
+
+  const status = reported['agent_status'];
+  if (typeof status !== 'string') malformed('the result carries no agent_status string');
+  // Pane-addressed: `pane get` reports the agent's kind, not the name herdr registered it under,
+  // and this is the handle a launch whose acknowledgement was lost has to adopt.
+  const agent = { pane };
+  switch (status) {
+    case 'idle':
+    case 'done':
+      return { kind: 'ready', agent };
+    case 'working':
+      return { kind: 'working', agent };
+    case 'blocked':
+      // No dialog text is invented: `pane get` did not provide any.
+      return { kind: 'not_ready', agent, detail: 'herdr reports a blocked state' };
+    case 'unknown':
+      return { kind: 'state_unknown', agent, detail: 'herdr reports the agent state as unknown' };
+    default:
+      // An unsupported value is not a state to act on, and must never fall through to ready.
+      return malformed(`agent_status ${String(status)} is not a state herdr reports`);
   }
 }
