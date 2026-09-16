@@ -29,7 +29,9 @@ const started = { type: 'run_started', pipeline: 'feature-loop', task: 'A task' 
  * Written out from the fixtures by hand, not produced by `replay`: comparing the implementation
  * with itself would establish nothing. Handoff counts and last seq come from the files.
  */
-const expected: Record<string, Partial<RunState> & { handoffs: number }> = {
+// `handoffs` here is a *count*, not the records themselves, so it replaces the field rather than
+// intersecting with it — `readonly HandoffRecord[] & number` is a type nothing can satisfy.
+const expected: Record<string, Omit<Partial<RunState>, 'handoffs'> & { handoffs: number }> = {
   'approve-round-1': { status: 'done', round: 1, lastSeq: 10, handoffs: 1 },
   blocked: {
     status: 'paused',

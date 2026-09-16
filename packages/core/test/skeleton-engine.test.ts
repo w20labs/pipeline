@@ -9,11 +9,10 @@ import {
   type ScenarioInput,
   type TurnId,
 } from '@pipeline/runtime';
-import Ajv2020 from 'ajv/dist/2020.js';
-import addFormats from 'ajv-formats';
 import { describe, expect, it } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 
+import { strictAjv } from './support/ajv.js';
 import type { PipelineEvent } from '../src/runlog/events.js';
 import { openRunLog, readEvents } from '../src/runlog/log.js';
 import { replay } from '../src/runlog/state.js';
@@ -28,8 +27,7 @@ const golden = (name: string) =>
     expect: PipelineEvent[];
   };
 
-const ajv = new Ajv2020({ strict: true, allErrors: true });
-addFormats(ajv);
+const ajv = strictAjv();
 const validEvent = ajv.compile(
   JSON.parse(readFileSync(spec('events.schema.json'), 'utf8')) as object,
 );

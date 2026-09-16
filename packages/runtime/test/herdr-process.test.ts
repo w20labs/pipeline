@@ -86,10 +86,12 @@ describe('running a gate', () => {
   it('returns the handle before it dispatches anything', async () => {
     let dispatched = 0;
     const runner = createGateRunner({
-      spawn: (...args: Parameters<typeof spawn>) => {
+      // `typeof spawn` is a set of overloads; a single arrow matching the general one is not
+      // assignable to it, so the double is cast the way every other double here is.
+      spawn: ((...args: Parameters<typeof spawn>) => {
         dispatched += 1;
         return spawn(...args);
-      },
+      }) as unknown as typeof spawn,
     });
     const launch = runner.start({ node: 'test_gate', command: 'echo ok', cwd: dir }, LATER());
     expect(launch.executionId).toBeTruthy();

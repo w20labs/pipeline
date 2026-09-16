@@ -1,10 +1,10 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import Ajv2020 from 'ajv/dist/2020.js';
-import addFormats from 'ajv-formats';
 import { parse as parseYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
+
+import { strictAjv } from './support/ajv.js';
 
 /**
  * Structural validation of the specification artifacts in spec/.
@@ -17,8 +17,7 @@ const fixtureUrl = (name: string) =>
   fileURLToPath(new URL(`./fixtures/spec/${name}`, import.meta.url));
 const readJson = (path: string): object => JSON.parse(readFileSync(path, 'utf8')) as object;
 
-const ajv = new Ajv2020({ strict: true, allErrors: true });
-addFormats(ajv); // standard formats (date-time) are a plugin, not built in
+const ajv = strictAjv(); // date-time is a plugin format, not a built-in one
 ajv.addSchema(readJson(specUrl('events.schema.json')));
 const validateEvent = ajv.getSchema('https://pipeline.local/spec/events.schema.json');
 const validateScenario = ajv.compile(readJson(specUrl('scenario.schema.json')));
@@ -83,12 +82,12 @@ describe('events.schema.json', () => {
     expect(validateEvent).toBeTypeOf('function');
   });
 
-  it.each(Object.keys(validEvents))('accepts a valid %s event', (type) => {
-    expect(validateEvent?.(validEvents[type])).toBe(true);
+  it.each(Object.entries(validEvents))('accepts a valid %s event', (_type, payload) => {
+    expect(validateEvent?.(payload)).toBe(true);
   });
 
-  it.each(Object.keys(invalidEvents))('rejects %s', (name) => {
-    expect(validateEvent?.(invalidEvents[name])).toBe(false);
+  it.each(Object.entries(invalidEvents))('rejects %s', (_name, payload) => {
+    expect(validateEvent?.(payload)).toBe(false);
   });
 
   it('declares exactly the seven approved event types, in the root enum and in every branch', () => {
@@ -185,12 +184,12 @@ describe('scenario.schema.json', () => {
     expect(validateScenario(scenario())).toBe(true);
   });
 
-  it.each(Object.keys(validInputs))('accepts %s', (name) => {
-    expect(validateScenario(input(validInputs[name]))).toBe(true);
+  it.each(Object.entries(validInputs))('accepts %s', (_name, payload) => {
+    expect(validateScenario(input(payload))).toBe(true);
   });
 
-  it.each(Object.keys(invalidScenarios))('rejects %s', (name) => {
-    expect(validateScenario(invalidScenarios[name])).toBe(false);
+  it.each(Object.entries(invalidScenarios))('rejects %s', (_name, scenario) => {
+    expect(validateScenario(scenario)).toBe(false);
   });
 
   it('rejects the invalid YAML fixture', () => {
@@ -310,57 +309,60 @@ describe('cross-file references', () => {
   });
 });
 
-const pipelineWith = (mutate: (p: Record<string, never>) => void) => {
-  const p = structuredClone(byBasename.get('reference')) as unknown as Record<string, never>;
+type Json = Record<string, unknown>;
+
+const pipelineWith = (mutate: (p: Json) => void): Json => {
+  const p = structuredClone(byBasename.get('reference')) as unknown as Json;
   mutate(p);
   return p;
 };
 
+/**
+ * One node of the reference pipeline, by name.
+ *
+ * Refusing a name the pipeline does not have matters: a mutation that silently changed nothing
+ * would leave the fixture *valid*, and its "rejects ..." test would then pass for the wrong reason.
+ */
+const nodeOf = (p: Json, name: string): Json => {
+  const node = (p['nodes'] as Record<string, Json | undefined>)[name];
+  if (node === undefined) throw new Error(`the reference pipeline has no node ${name}`);
+  return node;
+};
+const portsOf = (p: Json, name: string): Json => nodeOf(p, name)['next'] as Json;
+
 const invalidPipelines: Record<string, object> = {
   'gate missing its required run field': pipelineWith((p) => {
-    delete (p.nodes as Record<string, Record<string, unknown>>).test_gate.run;
+    delete nodeOf(p, 'test_gate')['run'];
   }),
   'gate missing its required timeout': pipelineWith((p) => {
-    delete (p.nodes as Record<string, Record<string, unknown>>).test_gate.timeout;
+    delete nodeOf(p, 'test_gate')['timeout'];
   }),
   'unknown node type': pipelineWith((p) => {
-    (p.nodes as Record<string, Record<string, unknown>>).test_gate.type = 'webhook';
+    nodeOf(p, 'test_gate')['type'] = 'webhook';
   }),
   'invalid agent permission': pipelineWith((p) => {
-    (p.nodes as Record<string, Record<string, unknown>>).reviewer.permission = 'write';
+    nodeOf(p, 'reviewer')['permission'] = 'write';
   }),
   'malformed duration': pipelineWith((p) => {
-    (p.nodes as Record<string, Record<string, unknown>>).test_gate.timeout = '10 minutes';
+    nodeOf(p, 'test_gate')['timeout'] = '10 minutes';
   }),
   'non-positive round limit': pipelineWith((p) => {
-    (p.limits as Record<string, unknown>).max_rounds = 0;
+    (p['limits'] as Json)['max_rounds'] = 0;
   }),
   'unexpected top-level property': pipelineWith((p) => {
-    (p as Record<string, unknown>).retries = 3;
+    p['retries'] = 3;
   }),
   'unexpected node property': pipelineWith((p) => {
-    (p.nodes as Record<string, Record<string, unknown>>).reviewer.model = 'sonnet';
+    nodeOf(p, 'reviewer')['model'] = 'sonnet';
   }),
   'port that the node type does not define': pipelineWith((p) => {
-    (
-      (p.nodes as Record<string, Record<string, Record<string, unknown>>>).test_gate.next as Record<
-        string,
-        unknown
-      >
-    ).approve = 'done';
+    portsOf(p, 'test_gate')['approve'] = 'done';
   }),
   'edge long form missing its message': pipelineWith((p) => {
-    (
-      (p.nodes as Record<string, Record<string, Record<string, unknown>>>).reviewer.next as Record<
-        string,
-        unknown
-      >
-    ).revise = {
-      to: 'implementer',
-    };
+    portsOf(p, 'reviewer')['revise'] = { to: 'implementer' };
   }),
   'wrong schema version': pipelineWith((p) => {
-    (p as Record<string, unknown>).version = 2;
+    p['version'] = 2;
   }),
   'empty object': {},
 };
@@ -370,8 +372,8 @@ describe('reference.schema.json rejects malformed pipelines', () => {
     expect(validatePipeline(pipelineWith(() => {}))).toBe(true);
   });
 
-  it.each(Object.keys(invalidPipelines))('rejects a pipeline with %s', (name) => {
-    expect(validatePipeline(invalidPipelines[name])).toBe(false);
+  it.each(Object.entries(invalidPipelines))('rejects a pipeline with %s', (_name, pipeline) => {
+    expect(validatePipeline(pipeline)).toBe(false);
   });
 });
 

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
 import type {
+  DeadlineEpochMs,
   ExecutionId,
   LayoutSpec,
   ProcessObservation,
@@ -131,6 +132,34 @@ const stubGate = () => {
 };
 
 const gateSpec: ProcessSpec = { node: 'gate', command: 'pnpm test', cwd: '/repo' };
+
+/** What one row of the observation-forwarding table asks for. Named so every row shares it: the
+ * union inferred from the rows alone takes its shape from the first, which carries no signal. */
+interface Observation {
+  readonly id: ExecutionId;
+  readonly deadline: DeadlineEpochMs;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * Assertions for the compiler, not the runner.
+ *
+ * Never called, and nothing here runs: `pnpm typecheck` is what reads it. Each `@ts-expect-error`
+ * fails that check the day the option above it becomes accepted again, which is the half of the
+ * restriction the behavioural tests below cannot see — they can only show that a value smuggled
+ * past the type is ignored.
+ */
+const optionsExcludeBoundingAndCancellation = (): void => {
+  // @ts-expect-error a deadline is one absolute instant, so it belongs to an invocation and not
+  // to a runtime that will make many
+  createHerdrRuntime({ herdr: { session: 's', deadline: Date.now() } });
+  // @ts-expect-error cancellation is what shutdown() is for
+  createHerdrRuntime({ herdr: { session: 's', signal: AbortSignal.abort() } });
+  // the control: what a caller may legitimately set still compiles, so the two refusals above are
+  // about those two fields and not about the option bag being closed to everything
+  createHerdrRuntime({ herdr: { session: 's', executable: 'herdr', maxBuffer: 1024 } });
+};
+void optionsExcludeBoundingAndCancellation;
 
 describe('the herdr runtime as an adapter', () => {
   it('is exactly the four methods it claims, and no more', () => {
@@ -394,7 +423,7 @@ describe('forwarding gate work', () => {
     expect(gate.commands).toHaveLength(0); // neither one reached a shell
   });
 
-  it.each([
+  it.each<[string, (id: ExecutionId) => Observation, Record<string, unknown>]>([
     [
       'an identity it never issued',
       () => ({ id: 'gate-404' as ExecutionId, deadline: Date.now() + 30_000 }),
@@ -402,12 +431,12 @@ describe('forwarding gate work', () => {
     ],
     [
       'a deadline that is already spent',
-      (id: ExecutionId) => ({ id, deadline: Date.now() - 1 }),
+      (id) => ({ id, deadline: Date.now() - 1 }),
       { kind: 'timed_out' },
     ],
     [
       'a caller that already aborted',
-      (id: ExecutionId) => ({ id, deadline: Date.now() + 30_000, signal: AbortSignal.abort() }),
+      (id) => ({ id, deadline: Date.now() + 30_000, signal: AbortSignal.abort() }),
       { kind: 'cancelled' },
     ],
   ])('passes %s through when observing', async (_label, shape, expected) => {

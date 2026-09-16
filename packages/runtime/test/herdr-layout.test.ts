@@ -31,6 +31,21 @@ const script = (...responses: { code: number; stdout: string; stderr: string }[]
   return { run, calls, verb: () => calls.map((c) => c.slice(0, 2).join(' ')) };
 };
 
+/**
+ * The error a layout call rejected with.
+ *
+ * Narrower than `.catch(cause => cause as HerdrError)`, which widens the awaited type to include
+ * the pane, and stricter: a call that *resolves* says so here rather than failing later on a
+ * missing property.
+ */
+const rejection = async (work: Promise<unknown>): Promise<HerdrError> =>
+  work.then(
+    (value) => {
+      throw new Error(`expected a rejection, got ${String(value)}`);
+    },
+    (cause: unknown) => cause as HerdrError,
+  );
+
 /** A rename answer that actually confirms the pane and label it was asked about. */
 const renamed = (pane: string, label: string) => ({
   code: 0,
@@ -187,9 +202,7 @@ describe('confirming what the answer is about', () => {
       stdout: '{"id":"cli:x","result":{"type":"something_else"}}',
       stderr: '',
     });
-    const error = await createLayout(spec(destination), { run: s.run }).catch(
-      (cause: unknown) => cause as HerdrError,
-    );
+    const error = await rejection(createLayout(spec(destination), { run: s.run }));
     expect(error).toMatchObject({ fault: 'malformed' });
     expect(error.message).toContain(`not ${wanted}`);
   });
@@ -279,10 +292,11 @@ describe('when creation itself fails', () => {
 
   it('reports a rejected direction as the usage error it is', async () => {
     const s = script(recorded('pane-split', 'error-bad-direction'));
-    const error = await createLayout(
-      spec({ kind: 'split', pane: 'wA:p1' as PaneId, direction: 'right' }),
-      { run: s.run },
-    ).catch((cause: unknown) => cause as HerdrError);
+    const error = await rejection(
+      createLayout(spec({ kind: 'split', pane: 'wA:p1' as PaneId, direction: 'right' }), {
+        run: s.run,
+      }),
+    );
     expect(error).toMatchObject({ fault: 'usage', exitCode: 2 });
     expect(error.message).toContain('invalid split direction');
   });
@@ -293,10 +307,11 @@ describe('when creation itself fails', () => {
       stdout: '{"id":"cli:pane:split","result":{"type":"pane_info"}}',
       stderr: '',
     });
-    const error = await createLayout(
-      spec({ kind: 'split', pane: 'wA:p1' as PaneId, direction: 'right' }),
-      { run: s.run },
-    ).catch((cause: unknown) => cause as HerdrError);
+    const error = await rejection(
+      createLayout(spec({ kind: 'split', pane: 'wA:p1' as PaneId, direction: 'right' }), {
+        run: s.run,
+      }),
+    );
     expect(error).not.toBeInstanceOf(LayoutError); // nothing was established to preserve
     expect(error.fault).toBe('malformed');
     expect(s.calls).toHaveLength(1);

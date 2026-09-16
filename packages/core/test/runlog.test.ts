@@ -13,10 +13,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import Ajv2020 from 'ajv/dist/2020.js';
-import addFormats from 'ajv-formats';
 import { beforeAll, describe, expect, it } from 'vitest';
 
+import { strictAjv } from './support/ajv.js';
 import { HandoffError } from '../src/runlog/handoff.js';
 import { projectLog, readSnapshot } from '../src/runlog/snapshot.js';
 import {
@@ -28,8 +27,7 @@ import {
   type PipelineEvent,
 } from '../src/runlog/index.js';
 
-const ajv = new Ajv2020({ strict: true, allErrors: true });
-addFormats(ajv);
+const ajv = strictAjv();
 const validateEvent = ajv.compile(
   JSON.parse(
     readFileSync(
