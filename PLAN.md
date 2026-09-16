@@ -302,6 +302,34 @@ lines are needed to capture them).
 
 **Not in this step:** parser code.
 
+### Step 04b — Turn attribution research
+**Depends on:** 04 · **Files:** `docs/turn-attribution.md`, `tools/attribution-spike/`,
+`packages/runtime/test/fixtures/turn-attribution/`
+
+**Build:** run real Claude Code and Codex turns in an isolated herdr session and record, for each
+turn, what the *pane* showed and what the agent's own transcript held, sampled on a timeline.
+
+Step 04 established that a settled state and a successful exit do not establish that *this* prompt
+completed. This step asks the next question: what evidence does establish it. Two captures can show
+that a pane changed; they cannot show that a completed answer belongs to a given submission. The
+candidates compared are the rendered pane and the agents' native transcripts
+(`~/.claude/projects/<slug>/<session>.jsonl`, `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`),
+which are read-only to Pipeline and written by the agent itself — so reading them grants a
+read-only reviewer nothing, and R6 stands.
+
+Agents run with the read-only settings verified in `docs/agent-cli-notes.md`. Paths, record shapes
+and flags are version-specific findings, recorded with the versions they were observed on.
+
+**Done when:**
+- `docs/turn-attribution.md` answers, with data: can a transcript be bound to a pane when two
+  sessions of the same agent share a working directory; what distinguishes commentary, tool
+  activity and partial output from a completed answer **that carries no verdict**; which records
+  tell two identical submissions apart; how far apart the pane and transcript reads are, and
+  whether a capture taken at settlement is complete.
+- Fixtures exist for each scenario, with the run's own `run.json` recording versions and bounds.
+
+**Not in this step:** any attribution rule in production code. This is evidence for step 12.
+
 ### Step 05 — SPEC.md and golden scenarios
 **Depends on:** 04 · **Files:** `docs/SPEC.md`, `spec/scenario.schema.json`,
 `spec/events.schema.json`, `spec/pipelines/`, `spec/scenarios/`, one test that validates them ·
@@ -420,7 +448,8 @@ is a later concern, and must not put the exit status back at risk.
 **Not in this step:** agents.
 
 ### Step 12 — HerdrRuntime: agents
-**Depends on:** 11 · **Files:** `packages/runtime/src/herdr/agent.ts`
+**Depends on:** 11, and 04b for everything past `inspectAgent` ·
+**Files:** `packages/runtime/src/herdr/agent.ts`
 
 **Build:** `launchAgent`, `inspectAgent`, `promptAgent`, `observeAgentTurn` and `readAgentOutput`
 using herdr's agent state. The read window is sized from the step 04 findings.
@@ -655,6 +684,11 @@ Integration tests run golden scenarios in real herdr panes.
 **Done when:**
 - With `PIPELINE_HERDR_IT=1`, gate-fail-then-pass and revise-twice pass on real herdr, and their
   events match the FakeRuntime runs.
+
+**What this step cannot establish.** A scriptable fake agent exercises the engine's conformance
+through real herdr; it renders nothing a real Claude or Codex renders. Evidence about agent output
+and turn attribution comes from step 04b, and ongoing compatibility with live agent CLIs from
+step 32.
 
 ### Step 32 — Live test suite
 **Depends on:** 31 · **Files:** `packages/runtime/test/live/`, `docs/test-live.md`

@@ -113,6 +113,12 @@ importers:
         specifier: ^8.3.0
         version: 8.3.0(@types/node@20.19.43)(esbuild@0.28.2)(yaml@2.9.1)
 
+  tools/attribution-spike:
+    devDependencies:
+      '@types/node':
+        specifier: ^20.19.9
+        version: 20.19.43
+
 packages:
 
   '@cacheable/memory@2.2.0':
