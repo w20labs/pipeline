@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events';
 import {
   acquireLockBounded,
   type AcquireOptions,
+  type AcquireOutcome,
   LOCK_HELPER,
   LOCK_OUTPUT_BYTES,
   type LockOwner,
@@ -120,11 +121,15 @@ describe('taking the lock through the helper', () => {
     signal?: string | null;
     /** Accept no stdin, so delivery cannot be confirmed. */
     refuseInput?: boolean;
+    /** 'close' (default): exit then close. 'exit-only': exit, streams held open. 'never': no end. */
+    end?: 'close' | 'exit-only' | 'never';
   }
   /** A helper that answers as scripted and records its argv and the record it was given. */
   const fakeHelper = (script: Script) => {
     const argv: string[][] = [];
     const written: string[] = [];
+    const signals: string[] = [];
+    const children: (EventEmitter & { stdout: EventEmitter })[] = [];
     const stub = ((_command: string, args: string[]) => {
       argv.push(args);
       const stream = () => Object.assign(new EventEmitter(), { destroy: () => undefined });
@@ -141,19 +146,21 @@ describe('taking the lock through the helper', () => {
         stdout: stream(),
         stderr: stream(),
         unref: () => undefined,
-        kill: () => true,
+        kill: (signal: string) => (signals.push(signal), true),
       });
+      children.push(child);
       queueMicrotask(() => {
         child.emit('spawn');
         if (script.stderr !== undefined) child.stderr.emit('data', Buffer.from(script.stderr));
         if (script.stdout !== undefined) child.stdout.emit('data', Buffer.from(script.stdout));
+        if (script.end === 'never') return;
         const exit = script.exit === undefined ? 0 : script.exit;
         child.emit('exit', exit, script.signal ?? null);
-        child.emit('close', exit, script.signal ?? null);
+        if (script.end !== 'exit-only') child.emit('close', exit, script.signal ?? null);
       });
       return child;
     }) as unknown as typeof spawn;
-    return { spawn: stub, argv, written };
+    return { spawn: stub, argv, written, signals, children };
   };
   const line = (result: unknown) => `${JSON.stringify(result)}\n`;
   const ACQUIRED = line({ kind: 'acquired', diagnostics: [] });
@@ -424,6 +431,148 @@ describe('taking the lock through the helper', () => {
       handle: { controlDir: DIR, runId: 'run-1' },
       problems: ['reason is unknown'],
     });
+  });
+
+  it.each([
+    ['exits 1', { stdout: ACQUIRED, exit: 1 }, ['exited 1']],
+    [
+      'is killed',
+      { stdout: ACQUIRED, exit: null, signal: 'SIGSEGV' },
+      ['killed by SIGSEGV', 'exited null'],
+    ],
+    [
+      'is killed and complains',
+      { stdout: ACQUIRED, exit: null, signal: 'SIGSEGV', stderr: 'oh no\n' },
+      ['killed by SIGSEGV', 'exited null', 'wrote to stderr'],
+    ],
+    // a name that merely starts like a signal, and an exit code that merely starts like a number
+    [
+      'names an odd signal',
+      { stdout: ACQUIRED, exit: null, signal: 'SIGTERM extra' },
+      ['unrecognized', 'exited null'],
+    ],
+    [
+      'reports a lowercase signal',
+      { stdout: ACQUIRED, exit: null, signal: 'sigsegv' },
+      ['unrecognized', 'exited null'],
+    ],
+    ['exits with a fraction', { stdout: ACQUIRED, exit: 1.5 }, ['unrecognized']],
+  ] as [string, Script, string[]][])(
+    'sanitizes what it reports when the helper %s',
+    async (_label, script, categories) => {
+      const { outcome } = await take(script);
+      expect(outcome).toEqual({
+        kind: 'unknown',
+        handle: { controlDir: DIR, runId: 'run-1' },
+        problems: categories,
+      });
+    },
+  );
+
+  it('spawns nothing once the deadline has passed, and never ran either way', async () => {
+    // the same category as a spawn failure: both mean the helper never ran, which L2b must not clean up after
+    const { outcome, helper } = await take({ stdout: ACQUIRED }, { deadline: Date.now() - 1 });
+    expect(outcome).toEqual({
+      kind: 'unknown',
+      handle: { controlDir: DIR, runId: 'run-1' },
+      problems: ['did not run', 'the output is not exactly one line'],
+    });
+    expect(helper.argv).toEqual([]);
+  });
+
+  describe('on controlled time', () => {
+    afterEach(() => vi.useRealTimers());
+    const T0 = 1_000_000;
+    const D = T0 + 10_000;
+    const clocked = async (script: Script) => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      vi.setSystemTime(T0);
+      const helper = fakeHelper(script);
+      let outcome: AcquireOutcome | undefined;
+      void acquireLockBounded(DIR, OWNER, {
+        deadline: D,
+        spawn: helper.spawn,
+        now: Date.now,
+        random: fixed(TOKEN, NONCE).random,
+      }).then((r) => (outcome = r));
+      return { helper, settled: () => outcome };
+    };
+
+    it('gives up on a helper that never ends, having asked it to stop', async () => {
+      const run = await clocked({ stdout: ACQUIRED, end: 'never' });
+      await vi.advanceTimersByTimeAsync(10_000 - 1);
+      expect(run.settled()).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      // this is the run whose private eligibility is unresolved: L2b must refuse to clean up after it
+      expect(run.settled()).toEqual({
+        kind: 'unknown',
+        handle: { controlDir: DIR, runId: 'run-1' },
+        problems: ['ended early', 'signalled to stop'],
+      });
+      expect(run.helper.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    });
+
+    it('gives up on a helper that exited without closing its streams', async () => {
+      const run = await clocked({ stdout: ACQUIRED, end: 'exit-only' });
+      await vi.advanceTimersByTimeAsync(10_000);
+      // the same category as above, but it was seen to end: L2b may clean up after this one
+      expect(run.settled()).toEqual({
+        kind: 'unknown',
+        handle: { controlDir: DIR, runId: 'run-1' },
+        problems: ['ended early'],
+      });
+      expect(run.helper.signals).toEqual([]);
+    });
+
+    it('is unchanged by anything the helper does after it settles', async () => {
+      const run = await clocked({ stdout: ACQUIRED, end: 'never' });
+      await vi.advanceTimersByTimeAsync(10_000);
+      const settled = structuredClone(run.settled());
+      const child = run.helper.children[0];
+      child?.stdout.emit('data', Buffer.from(ACQUIRED));
+      child?.emit('exit', 0, null);
+      child?.emit('close', 0, null);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(run.settled()).toEqual(settled);
+      expect(Object.isFrozen(run.settled())).toBe(true);
+    });
+  });
+
+  it('keeps its secrets, and the helper’s words, out of every outcome', async () => {
+    const outcomes: AcquireOutcome[] = [];
+    const SENTINEL = 'SENTINEL-OUTPUT';
+    for (const script of [
+      { stdout: ACQUIRED },
+      { stdout: line({ kind: 'held', diagnostics: [] }) },
+      { stdout: line({ kind: 'refused', reason: 'capability', errno: null, diagnostics: [] }) },
+      { stdout: `${SENTINEL}\n` },
+      { stdout: ACQUIRED, stderr: `${SENTINEL}\n` },
+    ] as Script[])
+      outcomes.push((await take(script)).outcome);
+    outcomes.push(
+      await acquireLockBounded(
+        DIR,
+        { ...OWNER, pid: 0 },
+        {
+          deadline: Date.now() + 10_000,
+          spawn: fakeHelper({ stdout: ACQUIRED }).spawn,
+          random: fixed(TOKEN, NONCE).random,
+        },
+      ),
+    );
+    expect(outcomes.map((o) => o.kind)).toEqual([
+      'acquired',
+      'held',
+      'refused',
+      'unknown',
+      'unknown',
+      'not_attempted',
+    ]);
+    expect(outcomes.at(-1)).toEqual({ kind: 'not_attempted', reason: 'invalid_request' }); // no handle
+    for (const outcome of outcomes) {
+      const serialized = JSON.stringify(outcome);
+      for (const secret of [TOKEN, NONCE, SENTINEL]) expect(serialized).not.toContain(secret);
+    }
   });
 
   it('spawns nothing when the request is refused', async () => {
