@@ -4,10 +4,12 @@ import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 
 import {
+  checkRecords,
   identify,
   type Identity,
   PID_BOUNDS,
   type RecordedProcess,
+  recordProcess,
   validStartTime,
 } from '../src/process-identity.js';
 
@@ -37,10 +39,11 @@ interface Scripted {
   throws?: Error;
 }
 /** A `ps` that answers as scripted, recording how it was invoked. */
-const fakePs = (script: Scripted) => {
+const fakePs = (answer: Scripted | ((pid: string) => Scripted)) => {
   const calls: { args: string[]; env: NodeJS.ProcessEnv }[] = [];
   const spawnStub = ((_cmd: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
     calls.push({ args, env: options.env });
+    const script = typeof answer === 'function' ? answer(args[3] as string) : answer;
     if (script.throws !== undefined) throw script.throws;
     const stream = () => Object.assign(new EventEmitter(), { destroy: () => undefined });
     const child = Object.assign(new EventEmitter(), {
@@ -234,5 +237,125 @@ describe('absence, and everything that is not absence', () => {
     });
     expect(identity.kind).toBe('unresolved');
     expect(Date.now() - began).toBeLessThan(2_000);
+  });
+});
+
+describe('checking every recorded process', () => {
+  const live = (r: RecordedProcess) => `${r.pid} ${r.startedAt} ${r.command}\n`;
+  const A = { ...MAC, pid: 101 };
+  const B = { ...MAC, pid: 102 };
+  const C = { ...MAC, pid: 103 };
+  /** 101 absent, 102 reused, 103 still running as recorded — unless a case says otherwise. */
+  const answers = (over: Record<string, Scripted> = {}) =>
+    fakePs(
+      (pid) =>
+        over[pid] ??
+        (pid === '101'
+          ? { exit: 1 }
+          : pid === '102'
+            ? { exit: 0, stdout: live({ ...B, startedAt: 'Wed Sep 16 19:29:48 2026' }) }
+            : { exit: 0, stdout: live(C) }),
+    );
+  const check = (records: RecordedProcess[], ps = answers(), deadline = Date.now() + 5_000) =>
+    checkRecords(records, { deadline, platform: 'darwin', spawn: ps.spawn });
+  const kinds = (r: Awaited<ReturnType<typeof check>>) => r.outcomes.map((o) => o.identity.kind);
+
+  it('proceeds when every record is absent or reused, reporting each in order', async () => {
+    const result = await check([A, B]);
+    expect(result).toMatchObject({ proceed: true, checked: 2 });
+    expect(kinds(result)).toEqual(['absent', 'reused']);
+  });
+
+  it('refuses when any record is still running, still reporting all of them', async () => {
+    const result = await check([A, C, B]);
+    expect(result.proceed).toBe(false);
+    expect(kinds(result)).toEqual(['absent', 'leftover', 'reused']);
+  });
+
+  it('refuses when an identity is unresolved', async () => {
+    const result = await check(
+      [A, B],
+      answers({ '102': { exit: 0, stdout: live(B), stderr: 'x\n' } }),
+    );
+    expect(result.proceed).toBe(false);
+    expect(kinds(result)).toEqual(['absent', 'unresolved']);
+  });
+
+  it('refuses an invalid record without querying it, and still checks the rest', async () => {
+    const ps = answers();
+    const result = await check([A, { ...B, pid: 0 }, B], ps); // the invalid record is the only blocker
+    expect(kinds(result)).toEqual(['absent', 'invalid_record', 'reused']);
+    expect(result.proceed).toBe(false);
+    expect(ps.calls.map((c) => c.args[3])).toEqual(['101', '102']);
+  });
+
+  it('proceeds on an empty list, and says that nothing was checked', async () => {
+    expect(await check([])).toEqual({ proceed: true, checked: 0, outcomes: [] });
+  });
+
+  it('starts no query once the deadline is spent, reporting the rest unresolved — and invalid ones invalid', async () => {
+    let clock = 1_000_000;
+    const ps = fakePs((pid) => {
+      if (pid === '101') clock += 10_000; // this query uses up the whole budget
+      return { exit: 1 };
+    });
+    const result = await checkRecords([A, B, { ...C, pid: -1 }], {
+      deadline: clock + 5_000,
+      platform: 'darwin',
+      spawn: ps.spawn,
+      now: () => clock,
+    });
+    expect(ps.calls).toHaveLength(1);
+    expect(result.outcomes.map((o) => o.identity)).toEqual([
+      { kind: 'absent' }, // started within budget, so its answer stands
+      { kind: 'unresolved', why: 'the deadline was spent before this record was checked' },
+      { kind: 'invalid_record', why: 'pid -1 is not a pid on darwin (1 to 99999)' },
+    ]);
+    expect(result.proceed).toBe(false);
+  });
+
+  it('checks the records as they were when given, whatever the caller does meanwhile', async () => {
+    const records = [{ ...A }, { ...C }];
+    const pending = check(records);
+    records.push({ ...B });
+    (records[1] as { pid: number }).pid = 101;
+    const result = await pending;
+    expect(result.outcomes.map((o) => o.record.pid)).toEqual([101, 103]);
+    expect(kinds(result)).toEqual(['absent', 'leftover']);
+  });
+});
+
+describe('recording a process at launch', () => {
+  const record = (pid: number, script: Scripted) =>
+    recordProcess(pid, {
+      deadline: Date.now() + 5_000,
+      platform: 'darwin',
+      spawn: fakePs(script).spawn,
+    });
+
+  it('records what ps reports for a live pid', async () => {
+    expect(await record(59889, { exit: 0, stdout: EVIDENCE.macosLive })).toEqual({
+      ok: true,
+      record: MAC,
+    });
+  });
+
+  it.each([
+    ['an absent pid', 59889, { exit: 1 }, 'no process has pid 59889'],
+    [
+      'a malformed answer',
+      59889,
+      { exit: 0, stdout: 'nonsense\n' },
+      'ps answered with a malformed line',
+    ],
+    [
+      'stderr on success',
+      59889,
+      { exit: 0, stdout: EVIDENCE.macosLive, stderr: 'x\n' },
+      'ps succeeded but wrote to stderr',
+    ],
+    ['an invalid pid', 0, { exit: 1 }, 'pid 0 is not a pid on darwin (1 to 99999)'],
+  ])('refuses %s', async (_label, pid, script, why) => {
+    expect(await record(pid, script)).toEqual({ ok: false, why });
   });
 });

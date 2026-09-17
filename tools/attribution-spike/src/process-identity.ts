@@ -67,14 +67,20 @@ export const validStartTime = (text: string): boolean => {
 const validCommand = (command: string): boolean =>
   command.length > 0 && command.trim() === command && !/[\r\n]/.test(command);
 
+const validatePid = (pid: number, platform: NodeJS.Platform): string | undefined => {
+  const bound = PID_BOUNDS[platform];
+  if (bound === undefined) return `process identity is not supported on ${platform}`;
+  if (!Number.isInteger(pid) || pid < 1 || pid > bound)
+    return `pid ${String(pid)} is not a pid on ${platform} (1 to ${bound})`;
+  return undefined;
+};
+
 export const validateRecord = (
   record: RecordedProcess,
   platform: NodeJS.Platform,
 ): string | undefined => {
-  const bound = PID_BOUNDS[platform];
-  if (bound === undefined) return `process identity is not supported on ${platform}`;
-  if (!Number.isInteger(record.pid) || record.pid < 1 || record.pid > bound)
-    return `pid ${String(record.pid)} is not a pid on ${platform} (1 to ${bound})`;
+  const pid = validatePid(record.pid, platform);
+  if (pid !== undefined) return pid;
   if (!validStartTime(record.startedAt)) return 'the recorded start time is not a C/UTC lstart';
   if (!validCommand(record.command)) return 'the recorded command is empty or malformed';
   return undefined;
@@ -96,22 +102,14 @@ export interface QueryOptions {
   readonly now?: () => number;
 }
 
-export const identify = async (
-  given: RecordedProcess,
-  options: QueryOptions,
-): Promise<Identity> => {
-  // Copied before anything else: the caller's object can change while the query is pending, and a
-  // record changed mid-query must not turn a matching leftover into a reused pid.
-  const record: RecordedProcess = Object.freeze({
-    pid: given.pid,
-    startedAt: given.startedAt,
-    command: given.command,
-  });
-  const platform = options.platform ?? process.platform;
-  const invalid = validateRecord(record, platform);
-  if (invalid !== undefined) return { kind: 'invalid_record', why: invalid };
+type Queried =
+  | { readonly kind: 'observed'; readonly observed: RecordedProcess }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unresolved'; readonly why: string };
 
-  const outcome = await runChild('ps', ['-o', 'pid=,lstart=,comm=', '-p', String(record.pid)], {
+/** The one bounded, three-field, one-pid query, and what its answer establishes. Shared by both callers. */
+const query = async (pid: number, options: QueryOptions): Promise<Queried> => {
+  const outcome = await runChild('ps', ['-o', 'pid=,lstart=,comm=', '-p', String(pid)], {
     deadline: options.deadline,
     termGraceMs: 200,
     killGraceMs: 200,
@@ -138,11 +136,78 @@ export const identify = async (
   const observed = parseIdentityLine(lines[0] as string);
   if (observed === undefined)
     return { kind: 'unresolved', why: 'ps answered with a malformed line' };
-  if (observed.pid !== record.pid)
-    return { kind: 'unresolved', why: 'ps answered about another pid' };
+  if (observed.pid !== pid) return { kind: 'unresolved', why: 'ps answered about another pid' };
+  return { kind: 'observed', observed };
+};
 
+const snapshot = (given: RecordedProcess): RecordedProcess =>
+  Object.freeze({ pid: given.pid, startedAt: given.startedAt, command: given.command });
+
+export const identify = async (
+  given: RecordedProcess,
+  options: QueryOptions,
+): Promise<Identity> => {
+  // Copied before anything else: the caller's object can change while the query is pending, and a
+  // record changed mid-query must not turn a matching leftover into a reused pid.
+  const record = snapshot(given);
+  const invalid = validateRecord(record, options.platform ?? process.platform);
+  if (invalid !== undefined) return { kind: 'invalid_record', why: invalid };
+
+  const answer = await query(record.pid, options);
+  if (answer.kind !== 'observed') return answer;
+  const { observed } = answer;
   if (observed.startedAt !== record.startedAt) return { kind: 'reused', observed };
   if (observed.command !== record.command)
     return { kind: 'unresolved', why: 'same start time but a different command' };
   return { kind: 'leftover' };
+};
+
+/** The identity to record for a process this harness has just started. */
+export const recordProcess = async (
+  pid: number,
+  options: QueryOptions,
+): Promise<{ ok: true; record: RecordedProcess } | { ok: false; why: string }> => {
+  const invalid = validatePid(pid, options.platform ?? process.platform);
+  if (invalid !== undefined) return { ok: false, why: invalid };
+  const answer = await query(pid, options);
+  if (answer.kind === 'observed') return { ok: true, record: answer.observed };
+  return { ok: false, why: answer.kind === 'absent' ? `no process has pid ${pid}` : answer.why };
+};
+
+export interface Checked {
+  /** True only when every record is absent or reused. */
+  readonly proceed: boolean;
+  readonly checked: number;
+  readonly outcomes: readonly { readonly record: RecordedProcess; readonly identity: Identity }[];
+}
+
+const BLOCKS = new Set<Identity['kind']>(['leftover', 'unresolved', 'invalid_record']);
+
+/**
+ * Check every recorded process under one deadline, reporting each, and proceed only if none is
+ * still running or unknown. Once the deadline is spent no further query is started: what remains is
+ * reported unresolved, never absent — though an invalid record is still reported as invalid.
+ */
+export const checkRecords = async (
+  given: readonly RecordedProcess[],
+  options: QueryOptions,
+): Promise<Checked> => {
+  const records = given.map(snapshot);
+  const now = options.now ?? Date.now;
+  const outcomes: { record: RecordedProcess; identity: Identity }[] = [];
+  for (const record of records) {
+    const invalid = validateRecord(record, options.platform ?? process.platform);
+    const identity: Identity =
+      invalid !== undefined
+        ? { kind: 'invalid_record', why: invalid }
+        : options.deadline - now() <= 0
+          ? { kind: 'unresolved', why: 'the deadline was spent before this record was checked' }
+          : await identify(record, options);
+    outcomes.push({ record, identity });
+  }
+  return {
+    proceed: outcomes.every((o) => !BLOCKS.has(o.identity.kind)),
+    checked: outcomes.length,
+    outcomes,
+  };
 };
