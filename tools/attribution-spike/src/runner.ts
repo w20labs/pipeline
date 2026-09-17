@@ -21,9 +21,17 @@ export interface RunConfig {
   /** The operator's own Claude directory, named only so the research configuration can avoid it. */
   readonly operatorClaudeDir: string;
   readonly scratch: string;
+  /** Holds the run lock, the bootstrap manifest and the process records. Separate from all of the above. */
+  readonly controlDir: string;
   readonly budgetMs: number;
   readonly cleanupReserveMs: number;
 }
+
+export const CONTROL_FILES = Object.freeze({
+  lock: 'run.lock',
+  manifest: 'bootstrap.json',
+  processes: 'processes.jsonl',
+});
 
 export interface RunnerFs {
   /** Create exactly this directory; throw if it exists. */
@@ -99,19 +107,34 @@ const inside = (parent: string, child: string): boolean => {
   // `..research` is a name inside the parent; only a whole `..` segment leaves it
   return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 };
+/** Equal, or either inside the other. */
+const overlap = (a: string, b: string): boolean => inside(a, b) || inside(b, a);
 const positive = (n: number) => Number.isSafeInteger(n) && n > 0;
 
+/**
+ * Separation is lexical: the paths are compared as written. Directory ancestry is trusted, so this
+ * cannot establish physical separation through symlinks; it only refuses configurations whose own
+ * paths already overlap.
+ */
 export const configProblem = (c: RunConfig): string | undefined => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(c.runId)) return 'the run id must be a plain name';
-  const paths = [c.runsRoot, c.researchConfig, c.operatorClaudeDir, c.scratch];
+  const paths = [c.runsRoot, c.researchConfig, c.operatorClaudeDir, c.scratch, c.controlDir];
   if (!paths.every((p) => isAbsolute(p) && !p.includes('\0'))) return 'every path must be absolute';
-  if (
-    inside(c.operatorClaudeDir, c.researchConfig) ||
-    inside(c.researchConfig, c.operatorClaudeDir)
-  )
+  if (overlap(c.operatorClaudeDir, c.researchConfig))
     return "the research configuration must be separate from the operator's Claude directory";
-  if (inside(c.researchConfig, c.runsRoot))
-    return 'run directories must not be inside the research configuration';
+  if (overlap(c.researchConfig, c.runsRoot))
+    return 'run directories must be separate from the research configuration';
+  const protectedDirs: [string, string][] = [
+    [c.researchConfig, 'the research configuration'],
+    [c.operatorClaudeDir, "the operator's Claude directory"],
+    [c.runsRoot, 'the run directories'],
+  ];
+  for (const [dir, what] of protectedDirs)
+    if (overlap(c.controlDir, dir)) return `the control directory must be separate from ${what}`;
+  // stated for the files themselves, so renaming one can never place it where a run writes
+  for (const name of Object.values(CONTROL_FILES))
+    if (protectedDirs.some(([dir]) => inside(dir, join(c.controlDir, name))))
+      return 'a control file must not be inside a protected directory';
   if (!positive(c.budgetMs) || !positive(c.cleanupReserveMs) || c.cleanupReserveMs >= c.budgetMs)
     return 'the budget and cleanup reserve must be positive, with the reserve inside the budget';
   return undefined;
@@ -142,9 +165,30 @@ export const runResearch = async (
   fs: RunnerFs,
   now: () => number = Date.now,
 ): Promise<RunResult> => {
+  // Copied before anything else: a caller changing its config, its list or a phase object while the
+  // run is under way must not move a path, a deadline or which work runs. Methods keep their object.
+  const c: RunConfig = Object.freeze({
+    runId: config.runId,
+    runsRoot: config.runsRoot,
+    researchConfig: config.researchConfig,
+    operatorClaudeDir: config.operatorClaudeDir,
+    scratch: config.scratch,
+    controlDir: config.controlDir,
+    budgetMs: config.budgetMs,
+    cleanupReserveMs: config.cleanupReserveMs,
+  });
+  const plan: readonly Phase[] = Object.freeze(
+    phases.map((p) =>
+      Object.freeze({
+        name: p.name,
+        run: p.run.bind(p),
+        ...(p.cleanup === undefined ? {} : { cleanup: p.cleanup.bind(p) }),
+      }),
+    ),
+  );
   const refusedBeforeStart = (why: string): RunResult => ({
     outcome: { name: 'start', status: 'refused', why },
-    phases: phases.map((p) => ({ name: p.name, status: 'not_run', why: 'the run did not start' })),
+    phases: plan.map((p) => ({ name: p.name, status: 'not_run', why: 'the run did not start' })),
     cleanupDiagnostics: [],
     summary: {
       written: false,
@@ -152,12 +196,12 @@ export const runResearch = async (
       why: 'the run did not start; nothing was written',
     },
   });
-  const problem = configProblem(config);
+  const problem = configProblem(c);
   if (problem !== undefined) return refusedBeforeStart(problem);
 
-  const deadline = now() + config.budgetMs;
-  const phaseDeadline = deadline - config.cleanupReserveMs;
-  const runDir = join(config.runsRoot, config.runId);
+  const deadline = now() + c.budgetMs;
+  const phaseDeadline = deadline - c.cleanupReserveMs;
+  const runDir = join(c.runsRoot, c.runId);
   const created = await until((async () => fs.mkdirExclusive(runDir))(), phaseDeadline, now);
   // Either way the directory is left alone: an existing one may belong to another run, and one whose
   // creation timed out may still appear, and is not known to be ours.
@@ -171,7 +215,7 @@ export const runResearch = async (
   const records: PhaseRecord[] = [];
   const cleanups: Phase[] = [];
   let stop: Extract<PhaseRecord, { why: string }> | undefined;
-  for (const phase of phases) {
+  for (const phase of plan) {
     if (stop !== undefined || now() >= phaseDeadline) {
       const why =
         stop === undefined || stop.status === 'not_run'
@@ -243,9 +287,9 @@ export const runResearch = async (
   try {
     body = JSON.stringify(
       {
-        runId: config.runId,
-        budgetMs: config.budgetMs,
-        cleanupReserveMs: config.cleanupReserveMs,
+        runId: c.runId,
+        budgetMs: c.budgetMs,
+        cleanupReserveMs: c.cleanupReserveMs,
         ...result,
       },
       (_key, value: unknown) => (typeof value === 'bigint' ? value.toString() : value),

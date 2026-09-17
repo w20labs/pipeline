@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -20,6 +20,7 @@ const CONFIG: RunConfig = {
   researchConfig: '/cache/research/claude-config',
   operatorClaudeDir: '/home/op/.claude',
   scratch: '/cache/scratch',
+  controlDir: '/cache/research/control',
   budgetMs: 10_000,
   cleanupReserveMs: 2_000,
 };
@@ -63,6 +64,7 @@ describe('the research run skeleton', () => {
   it.each([
     ['a run id with a separator', { runId: 'a/b' }, 'the run id must be a plain name'],
     ['a relative path', { scratch: 'scratch' }, 'every path must be absolute'],
+    ['a relative control directory', { controlDir: 'control' }, 'every path must be absolute'],
     [
       'the operator directory itself',
       { researchConfig: '/home/op/.claude' },
@@ -86,12 +88,34 @@ describe('the research run skeleton', () => {
     [
       'runs under a ..-prefixed name inside the research configuration',
       { runsRoot: '/cache/research/claude-config/..runs' },
-      'run directories must not be inside the research configuration',
+      'run directories must be separate from the research configuration',
     ],
+    [
+      'a research configuration inside the run directories',
+      { researchConfig: '/cache/research/runs/config' },
+      'run directories must be separate from the research configuration',
+    ],
+    // each protected location, both ways: equal, inside (also under a ..-prefixed name), containing
+    ...(
+      [
+        ['the research configuration', {}, '/cache/research/claude-config'],
+        ["the operator's Claude directory", {}, '/home/op/.claude'],
+        ['the run directories', { runsRoot: '/data/runs' }, '/data/runs'],
+      ] as const
+    ).flatMap(([what, base, dir]) =>
+      [dir, `${dir}/control`, `${dir}/..control`, dirname(dir)].map(
+        (controlDir) =>
+          [
+            `the control directory ${controlDir} against ${what}`,
+            { ...base, controlDir },
+            `the control directory must be separate from ${what}`,
+          ] as const,
+      ),
+    ),
     [
       'runs inside the research configuration',
       { runsRoot: '/cache/research/claude-config/runs' },
-      'run directories must not be inside the research configuration',
+      'run directories must be separate from the research configuration',
     ],
     [
       'a reserve as large as the budget',
@@ -124,8 +148,12 @@ describe('the research run skeleton', () => {
     const siblings = {
       researchConfig: '/home/op/.claude..x',
       runsRoot: '/home/op/.claude..x..runs',
+      controlDir: '/home/op/.claude..x..runs..control',
     };
     expect(configProblem({ ...CONFIG, ...siblings })).toBeUndefined();
+    expect(
+      configProblem({ ...CONFIG, controlDir: '/cache/research/claude-config-control' }),
+    ).toBeUndefined();
   });
 
   it('runs phases in order, keeps only evidence they reported, and writes the summary last', async () => {
@@ -476,6 +504,66 @@ describe('the research run skeleton', () => {
       why: 'the run budget was spent',
     });
     expect(log).toEqual(['mkdir /cache/research/runs/run-1']);
+  });
+
+  it('keeps the config it started with, whatever the caller changes during the run', async () => {
+    clocked();
+    const { fs, written } = fakeFs();
+    const config = { ...CONFIG };
+    const seen: number[] = [];
+    const change = async () => {
+      Object.assign(config, {
+        runId: 'other',
+        runsRoot: '/elsewhere',
+        budgetMs: 1e9,
+        cleanupReserveMs: 1,
+      });
+      return { kind: 'completed' } as const;
+    };
+    const record: Phase['run'] = async ({ deadline }) => (
+      seen.push(deadline),
+      { kind: 'completed' }
+    );
+    const r = await runResearch(
+      config,
+      [
+        { name: 'a', run: change },
+        { name: 'b', run: record },
+      ],
+      fs,
+      Date.now,
+    );
+    expect(seen).toEqual([PHASE_DEADLINE]);
+    expect(r.summary).toEqual({ written: true, path: '/cache/research/runs/run-1/run.json' });
+    const body = JSON.parse(written['/cache/research/runs/run-1/run.json'] ?? '') as object;
+    expect(body).toMatchObject({ runId: 'run-1', budgetMs: 10_000, cleanupReserveMs: 2_000 });
+  });
+
+  it('runs the phases it was given, whatever the caller does to its list or phase objects', async () => {
+    const { fs } = fakeFs();
+    const ran: string[] = [];
+    const phase = (name: string): Phase => ({
+      name,
+      run: async () => (ran.push(name), { kind: 'completed' }),
+      cleanup: async () => (ran.push(`clean ${name}`), undefined),
+    });
+    const [b, c] = [phase('b'), phase('c')];
+    const phases: Phase[] = [];
+    const tamper = async () => {
+      phases.push(phase('pushed'));
+      phases[2] = phase('replacement');
+      Object.assign(b, {
+        name: 'renamed',
+        run: phase('swapped-run').run,
+        cleanup: phase('swapped-cleanup').cleanup,
+      });
+      return { kind: 'completed' } as const;
+    };
+    phases.push({ name: 'a', run: tamper }, b, c);
+    const r = await runResearch(CONFIG, phases, fs);
+    expect(ran).toEqual(['b', 'c', 'clean c', 'clean b']);
+    expect(r.phases.map((p) => p.name)).toEqual(['a', 'b', 'c']);
+    expect([Object.isFrozen(phases), Object.isFrozen(b)]).toEqual([false, false]); // the caller's objects stay theirs
   });
 
   describe('on a real filesystem', () => {
