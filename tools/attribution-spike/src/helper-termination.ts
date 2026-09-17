@@ -22,6 +22,8 @@ export const helperTermination = (
   }
   if (evidence.signalled.length > 0) problems.push('the helper was signalled to stop');
   if (evidence.outputExceeded === true) problems.push('the helper exceeded maxOutputBytes');
+  if (evidence.inputUnconfirmed === true)
+    problems.push('the helper input delivery was not confirmed');
   if (evidence.stderr !== '') problems.push('the helper wrote to stderr');
   return { problems, stdout: evidence.stdout };
 };

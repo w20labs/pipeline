@@ -29,7 +29,12 @@ export interface Evidence {
   readonly signalled: readonly Signalled[];
   /** Present when the output outgrew `maxOutputBytes`: what is here is a prefix, never the whole. */
   readonly outputExceeded?: true;
+  /** Present when input was given but its delivery was not confirmed. Nothing of the input is kept. */
+  readonly inputUnconfirmed?: true;
 }
+
+/** The most input `runChild` will deliver on stdin. */
+export const MAX_INPUT_BYTES = 64 * 1024;
 
 interface Ended {
   readonly at: number;
@@ -86,6 +91,13 @@ export interface ChildOptions {
    * Omitted, output is unbounded, as before.
    */
   readonly maxOutputBytes?: number;
+  /**
+   * Written to the child's stdin, which is then closed. At most `MAX_INPUT_BYTES`; copied when
+   * `runChild` is called. Delivery is confirmed by the writable stream's `finish`: its writes
+   * completed. That does not establish that the descriptor closed or that the child read the bytes.
+   * Omitted, stdin is ignored, as before.
+   */
+  readonly input?: string | Uint8Array;
 }
 
 export const runChild = async (
@@ -99,6 +111,20 @@ export const runChild = async (
   const budget = options.maxOutputBytes;
   if (budget !== undefined && !(Number.isSafeInteger(budget) && budget >= 0))
     return { kind: 'not_started', detail: 'maxOutputBytes must be a non-negative safe integer' };
+  // measured before anything is copied, so oversized input is never allocated here
+  const given: unknown = options.input;
+  const size =
+    given === undefined
+      ? 0
+      : typeof given === 'string'
+        ? Buffer.byteLength(given, 'utf8')
+        : given instanceof Uint8Array
+          ? given.byteLength
+          : -1;
+  if (size < 0) return { kind: 'not_started', detail: 'input must be a string or bytes' };
+  if (size > MAX_INPUT_BYTES)
+    return { kind: 'not_started', detail: 'input must be at most MAX_INPUT_BYTES bytes' };
+  const input = given === undefined ? undefined : Buffer.from(given as string | Uint8Array);
 
   // One streaming decoder per stream: a multi-byte character split across two chunks is only whole
   // once both halves have been seen, and the two streams interleave independently.
@@ -107,16 +133,21 @@ export const runChild = async (
   const signalled: Signalled[] = [];
   let retained = 0;
   let exceeded = false;
+  let inputFailed = false;
+  let inputFinished = false;
   const evidence = (): Evidence => ({
     ...text,
     signalled: [...signalled],
     ...(exceeded ? { outputExceeded: true as const } : {}),
+    ...(input !== undefined && (inputFailed || !inputFinished)
+      ? { inputUnconfirmed: true as const }
+      : {}),
   });
 
   let child: ChildProcess;
   try {
     child = options.spawn(command, [...args], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.env === undefined ? {} : { env: options.env }),
     });
@@ -162,6 +193,7 @@ export const runChild = async (
    * the outcome as it stood; destroying a stream is not a close, and none is recorded for it.
    */
   const release = (): void => {
+    releaseInput();
     for (const stream of ['stdout', 'stderr'] as const) {
       child[stream]?.off('data', capture[stream]);
       child[stream]?.destroy();
@@ -190,6 +222,32 @@ export const runChild = async (
   }
   child.once('close', onClose);
 
+  // Every lifecycle and stream handler above is attached before the one write, so an immediate
+  // response or failure is tracked. Failure is sticky: an error, a synchronous throw or a missing
+  // stream is never undone by a later `finish`.
+  const inputSink = (): void => undefined; // stays attached for good, so a late error is handled
+  const onInputError = (): void => void (inputFailed = true);
+  const onInputFinish = (): void => void (inputFinished = true);
+  function releaseInput(): void {
+    if (input === undefined || !child.stdin) return;
+    child.stdin.off('error', onInputError);
+    child.stdin.off('finish', onInputFinish);
+    child.stdin.destroy();
+  }
+  if (input !== undefined) {
+    if (!child.stdin) inputFailed = true;
+    else {
+      child.stdin.on('error', inputSink);
+      child.stdin.on('error', onInputError);
+      child.stdin.once('finish', onInputFinish);
+      try {
+        child.stdin.end(input);
+      } catch {
+        inputFailed = true;
+      }
+    }
+  }
+
   /**
    * Wait until `done` holds or `at` arrives. A phase whose time is already spent answers at once and
    * installs nothing: a zero-delay timer is clamped to a millisecond, and each one would carry the
@@ -216,20 +274,26 @@ export const runChild = async (
 
   /** The process has ended. Keep waiting for its output to be complete, but never past the deadline. */
   const settle = async (): Promise<ChildOutcome> => {
-    if (failure !== undefined)
-      return { kind: 'spawn_failed', detail: failure, evidence: evidence() };
+    if (failure !== undefined) {
+      const failed = evidence();
+      releaseInput();
+      return { kind: 'spawn_failed', detail: failure, evidence: failed };
+    }
     // An overflowed capture is incomplete however the streams end, so their close is not awaited —
     // including when the overflow arrives only while this wait is already under way.
     if (!exceeded) await waitUntil(deadline, () => closed !== undefined || exceeded);
-    if (closed !== undefined && !exceeded)
+    if (closed !== undefined && !exceeded) {
+      const complete = evidence();
+      releaseInput(); // delivery is judged as it stood at settlement
       return {
         kind: 'closed',
         closedAt: closed.at,
         ...(exited === undefined ? {} : { exitedAt: exited.at }),
         exitCode: closed.exitCode,
         signal: closed.signal,
-        evidence: evidence(),
+        evidence: complete,
       };
+    }
     const ended = (exited ?? closed) as Ended;
     const partial = evidence();
     release();
