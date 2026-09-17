@@ -1,11 +1,11 @@
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 /**
  * A real process, because the defect is one no stub can show: an open pipe keeps a Node process's
@@ -46,13 +46,6 @@ const gone = async (pid: number, withinMs: number): Promise<boolean> => {
 };
 
 describe('a caller whose child left a descendant holding stdout', () => {
-  beforeAll(() => {
-    execFileSync('pnpm', ['--filter', '@pipeline/attribution-spike', 'build'], {
-      cwd: fileURLToPath(new URL('../../..', import.meta.url)),
-      stdio: 'pipe',
-    });
-  }, 120_000);
-
   afterAll(async () => {
     // Only the process this fixture started, identified by the pid it reported — never by a pattern,
     // which cannot establish ownership and can match an unrelated process or a concurrent run.

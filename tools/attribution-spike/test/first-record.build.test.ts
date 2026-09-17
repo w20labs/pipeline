@@ -1,11 +1,11 @@
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 /**
  * The built package, not the sources: the Python helper is not something tsc emits, so this checks
@@ -17,12 +17,6 @@ const built = join(pkgRoot, 'dist');
 const scratch = mkdtempSync(join(tmpdir(), 'pipeline-first-record-build-'));
 
 describe('the built package', () => {
-  beforeAll(() => {
-    execFileSync('pnpm', ['--filter', '@pipeline/attribution-spike', 'build'], {
-      cwd: fileURLToPath(new URL('../../..', import.meta.url)),
-      stdio: 'pipe',
-    });
-  }, 120_000);
   afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
   it('ships the helper beside the compiled module', () => {
