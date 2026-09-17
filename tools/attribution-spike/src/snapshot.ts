@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { runChild } from './child.js';
+import { helperTermination } from './helper-termination.js';
 import { parseSnapshotStream, type SnapshotEntry } from './snapshot-stream.js';
 
 /**
@@ -70,22 +71,7 @@ export const takeSnapshot = async (root: string, options: SnapshotOptions): Prom
     },
   );
 
-  const termination: string[] = [];
-  let stdout = '';
-  if (outcome.kind === 'not_started' || outcome.kind === 'spawn_failed') {
-    termination.push(`the helper did not run: ${outcome.detail}`);
-  } else {
-    const { evidence } = outcome;
-    stdout = evidence.stdout;
-    if (outcome.kind !== 'closed') termination.push(`the helper ended ${outcome.kind}`);
-    else {
-      if (outcome.signal !== null) termination.push(`the helper was killed by ${outcome.signal}`);
-      if (outcome.exitCode !== 0) termination.push(`the helper exited ${String(outcome.exitCode)}`);
-    }
-    if (evidence.signalled.length > 0) termination.push('the helper was signalled to stop');
-    if (evidence.outputExceeded === true) termination.push('the helper exceeded maxOutputBytes');
-    if (evidence.stderr !== '') termination.push('the helper wrote to stderr');
-  }
+  const { problems: termination, stdout } = helperTermination(outcome);
 
   const parsed = parseSnapshotStream(stdout, { cap, maxLineBytes });
   return Object.freeze({
