@@ -88,6 +88,7 @@ const acquire = async (
   input: string | Uint8Array = JSON.stringify(RECORD),
   python?: string,
   mode: 'acquire' | 'release' = 'acquire',
+  cwd?: string,
 ) => {
   const argv = [HELPER, '--dir', dir, '--mode', mode];
   const pending = runChild(python ?? 'python3', argv, {
@@ -98,6 +99,7 @@ const acquire = async (
     now: Date.now,
     maxOutputBytes: 64_000,
     input,
+    ...(cwd === undefined ? {} : { cwd }),
   });
   running.push(pending);
   const outcome = await pending;
@@ -1140,5 +1142,272 @@ describe('taking the run lock', () => {
       await withLeftover(c);
       expect((await release(c.dir)).result).toEqual({ kind: 'released', diagnostics: [] });
     });
+  });
+
+  describe('and reporting what it may not clear up', () => {
+    const OTHER = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const release = (
+      dir: string,
+      input: string | Uint8Array = JSON.stringify(RECORD),
+      python?: string,
+    ) => acquire(dir, input, python, 'release');
+    const asFound = (path: string) => {
+      const info = lstatSync(path);
+      return {
+        ino: info.ino,
+        type: info.mode & 0o170000,
+        ...(info.isFile() ? { bytes: readFileSync(path, 'utf8') } : {}),
+        ...(info.isSymbolicLink() ? { points: readlinkSync(path) } : {}),
+      };
+    };
+    const tempPath = (c: Control) => join(c.dir, TEMP);
+    const OURS = JSON.stringify(RECORDED);
+    const leftover = async (c: Control, contents = OURS) => {
+      expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+      writeFileSync(tempPath(c), contents);
+    };
+    /** Swaps the leftover file once its own bytes have been read, before the recheck. */
+    const swapAfterTempRead = (make: string) =>
+      [
+        'real_read = os.read',
+        'reads = []',
+        'def reading(fd, n):',
+        '    data = real_read(fd, n)',
+        '    if data: reads.append(fd)',
+        '    if len(reads) == 2 and reads[0] != reads[1]:  # the lock first, then the leftover file',
+        `        reads.append(fd); ${make}`,
+        '    return data',
+        'os.read = reading',
+      ].join('\n');
+
+    it('will not remove a leftover replaced by a symlink to its own inode', async () => {
+      const c = control();
+      await leftover(c);
+      const kept = join(c.base, 'kept-temp');
+      // the same inode under another name: only a recheck that refuses to follow links refuses here
+      const patch = swapAfterTempRead(
+        `os.link(${JSON.stringify(tempPath(c))}, ${JSON.stringify(kept)}); os.unlink(${JSON.stringify(tempPath(c))}); os.symlink(${JSON.stringify(kept)}, ${JSON.stringify(tempPath(c))})`,
+      );
+      const shim = shimmed(c.base, 'python3-temp-symlink-swap', patch);
+      const { result } = await release(c.dir, JSON.stringify(RECORD), shim);
+      expect(result).toEqual({
+        kind: 'released',
+        diagnostics: [{ step: 'temp_replaced', errno: null }],
+      });
+      expect(asFound(tempPath(c))).toMatchObject({ points: kept });
+      expect(JSON.parse(readFileSync(kept, 'utf8'))).toEqual(RECORDED); // the record itself survives
+    });
+
+    const failing = (target: string, code: string, when = 'True') =>
+      [
+        `real_${target} = os.${target}`,
+        `def failing_${target}(*a, **k):`,
+        `    if ${when}: raise OSError(errno.${code}, os.strerror(errno.${code}))`,
+        `    return real_${target}(*a, **k)`,
+        `os.${target} = failing_${target}`,
+        `if real_${target} in os.supports_dir_fd: os.supports_dir_fd.add(failing_${target})`,
+        `if real_${target} in os.supports_follow_symlinks: os.supports_follow_symlinks.add(failing_${target})`,
+      ].join('\n');
+    /** By name: run.lock must still be released, so only the leftover file's own step may fail. */
+    const NOT_THE_LOCK = 'a[0] != "run.lock"';
+    /** Second file opened relative to the directory: the lock is first, the leftover second. */
+    const ONLY_TEMP = [
+      'opens = []',
+      'real_open = os.open',
+      'def counting_open(path, flags, *a, **k):',
+      '    fd = real_open(path, flags, *a, **k)',
+      '    if k.get("dir_fd") is not None: opens.append(fd)',
+      '    return fd',
+      'os.open = counting_open',
+      'os.supports_dir_fd.add(counting_open)',
+    ].join('\n');
+
+    it.each([
+      [
+        'its fstat',
+        `${ONLY_TEMP}\n${failing('fstat', 'EIO', 'len(opens) > 1')}`,
+        'temp_fstat_failed',
+        'EIO',
+      ],
+      [
+        'its read',
+        `${ONLY_TEMP}\n${failing('read', 'EIO', 'len(opens) > 1')}`,
+        'temp_read_failed',
+        'EIO',
+      ],
+      [
+        'its recheck',
+        `${ONLY_TEMP}\n${failing('stat', 'EIO', NOT_THE_LOCK)}`,
+        'temp_stat_failed',
+        'EIO',
+      ],
+      ['its unlink', failing('unlink', 'EACCES', NOT_THE_LOCK), 'temp_unlink_failed', 'EACCES'],
+    ])(
+      'reports a leftover it cannot clear because %s fails, leaving it as found',
+      async (_label, patch, step, errno) => {
+        const c = control();
+        await leftover(c);
+        const before = asFound(tempPath(c));
+        const shim = shimmed(c.base, `python3-${String(made.length)}-temp-fail`, patch);
+        const { result } = await release(c.dir, JSON.stringify(RECORD), shim);
+        // the lock itself is still released: only the leftover file's own step failed
+        expect(result).toEqual({ kind: 'released', diagnostics: [{ step, errno }] });
+        expect(entries(c.dir).lock).toBeUndefined();
+        expect(asFound(tempPath(c))).toEqual(before);
+      },
+    );
+
+    it('keeps an earlier leftover failure when its close then fails too', async () => {
+      const c = control();
+      await leftover(c, OURS.slice(0, 40)); // a partial record: reported, and never removed
+      const patch = [
+        ONLY_TEMP,
+        'real_close = os.close',
+        'def failing_close(fd):',
+        '    real_close(fd)',
+        '    if fd in opens[1:]: raise OSError(errno.EBADF, "bad")',
+        'os.close = failing_close',
+      ].join('\n');
+      const shim = shimmed(c.base, 'python3-temp-close-fails', patch);
+      const { result } = await release(c.dir, JSON.stringify(RECORD), shim);
+      // neither report is dropped, and the lock's outcome is untouched
+      expect(result).toEqual({
+        kind: 'released',
+        diagnostics: [
+          { step: 'temp_partial', errno: null },
+          { step: 'temp_close_failed', errno: 'EBADF' },
+        ],
+      });
+      expect(entries(c.dir).temp).toBe(OURS.slice(0, 40));
+    });
+
+    it.each([
+      [
+        'another run’s lock',
+        'not_ours',
+        (c: Control) =>
+          writeFileSync(
+            join(c.dir, 'run.lock'),
+            JSON.stringify({ ...RECORDED, runId: 'run-2', token: OTHER }),
+          ),
+        true,
+      ],
+      ['no lock at all', 'missing', (c: Control) => rmSync(join(c.dir, 'run.lock')), true],
+      [
+        'an unrecognized lock',
+        'unrecognized',
+        (c: Control) => writeFileSync(join(c.dir, 'run.lock'), 'not a record'),
+        true,
+      ],
+    ])('clears its own leftover beside %s', async (_label, kind, arrange, removed) => {
+      const c = control();
+      await leftover(c);
+      arrange(c);
+      const { result } = await release(c.dir);
+      expect(result).toEqual({ kind, diagnostics: [] });
+      expect(entries(c.dir).temp === undefined).toBe(removed);
+    });
+  });
+
+  describe('and touching nothing when it refuses early', () => {
+    const release = (dir: string, input: string | Uint8Array, python?: string, cwd?: string) =>
+      acquire(dir, input, python, 'release', cwd);
+    const asFound = (path: string) => {
+      const info = lstatSync(path);
+      return { ino: info.ino, type: info.mode & 0o170000, bytes: readFileSync(path, 'utf8') };
+    };
+    /** Logs every open, read and unlink: a refusal must show none of them touching the sentinel. */
+    const TOUCHES = [
+      'import json',
+      'real_open, real_read, real_unlink = os.open, os.read, os.unlink',
+      'def logged_open(path, flags, *a, **k):',
+      '    sys.stderr.write(json.dumps({"open": str(path), "dirFd": k.get("dir_fd") is not None}) + "\\n")',
+      '    fd = real_open(path, flags, *a, **k)',
+      '    sys.stderr.write(json.dumps({"opened": fd}) + "\\n")',
+      '    return fd',
+      'def logged_read(fd, n):',
+      '    sys.stderr.write(json.dumps({"read": fd}) + "\\n")',
+      '    return real_read(fd, n)',
+      'def logged_unlink(path, **k):',
+      '    sys.stderr.write(json.dumps({"unlink": str(path)}) + "\\n")',
+      '    return real_unlink(path, **k)',
+      'os.open, os.read, os.unlink = logged_open, logged_read, logged_unlink',
+      'if real_open in os.supports_dir_fd: os.supports_dir_fd.add(logged_open)',
+      'if real_unlink in os.supports_dir_fd: os.supports_dir_fd.add(logged_unlink)',
+    ].join('\n');
+
+    /**
+     * A complete record carrying this run's own token, so a cleanup that resolved the control
+     * directory anywhere but where it was told would remove it — and fail these tests.
+     */
+    const sentinel = (c: Control) => {
+      writeFileSync(join(c.dir, TEMP), JSON.stringify(RECORDED));
+      return asFound(join(c.dir, TEMP));
+    };
+
+    it.each([
+      ['a malformed token', 'arguments', JSON.stringify({ ...RECORD, token: 'nope' }), '', 0],
+      ['a missing capability', 'capability', JSON.stringify(RECORD), 'del os.O_NOFOLLOW', 0],
+      ['a missing directory', 'directory_missing', JSON.stringify(RECORD), '', 1],
+      ['a directory that is a file', 'directory_unusable', JSON.stringify(RECORD), '', 1],
+    ] as [string, string, string, string, number][])(
+      'refuses %s without touching the sentinel, from the sentinel’s own directory',
+      async (_label, reason, input, patch, attemptedOpens) => {
+        const c = control();
+        const before = sentinel(c);
+        const attempted =
+          reason === 'directory_missing'
+            ? join(c.dir, 'absent')
+            : reason === 'directory_unusable'
+              ? (writeFileSync(join(c.dir, 'plain'), ''), join(c.dir, 'plain'))
+              : c.dir;
+        const shim = shimmed(
+          c.base,
+          `python3-${String(made.length)}-early`,
+          `${patch}\n${TOUCHES}`,
+        );
+        // the helper runs *in* the sentinel's directory: a path resolved against the process,
+        // or one level up from the attempted path, would find it
+        const { result, stderr } = await release(attempted, input, shim, c.dir);
+        expect(result).toMatchObject({ kind: 'refused', reason });
+        const events = logged(stderr);
+        expect(events.filter((e) => 'opened' in e)).toHaveLength(0); // no descriptor was acquired
+        expect(events.filter((e) => 'open' in e)).toHaveLength(attemptedOpens);
+        expect(events.filter((e) => 'read' in e || 'unlink' in e)).toEqual([]);
+        expect(asFound(join(c.dir, TEMP))).toEqual(before);
+      },
+    );
+
+    it.each([
+      ['the leftover is removed', JSON.stringify(RECORDED), undefined],
+      [
+        'the leftover is left as another run’s',
+        JSON.stringify({ ...RECORDED, token: 'a'.repeat(32) }),
+        'temp_unrecognized',
+      ],
+      ['there is no leftover', undefined, undefined],
+    ])(
+      'closes every descriptor it opened, and writes one line, when %s',
+      async (_label, contents, step) => {
+        const c = control();
+        expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+        if (contents !== undefined) writeFileSync(join(c.dir, TEMP), contents);
+        const shim = shimmed(c.base, `python3-${String(made.length)}-cleanup-log`, LOG);
+        const { result, stderr } = await release(c.dir, JSON.stringify(RECORD), shim);
+        expect(result).toEqual({
+          kind: 'released',
+          diagnostics: step === undefined ? [] : [{ step, errno: null }],
+        });
+        const events = logged(stderr);
+        const opened = events.filter((e) => 'opened' in e).map((e) => e['opened']);
+        expect(opened.length).toBeGreaterThan(1); // the directory, the lock, and any leftover file
+        expect(
+          events
+            .filter((e) => 'close' in e)
+            .map((e) => e['close'])
+            .sort(),
+        ).toEqual([...opened].sort());
+      },
+    );
   });
 });
