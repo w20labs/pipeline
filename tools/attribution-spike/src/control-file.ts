@@ -1,6 +1,12 @@
+import { spawn as nodeSpawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+import { runChild } from './child.js';
+import { helperTermination } from './helper-termination.js';
+
 /**
- * Validates the one line `read-control-file.py` writes, and nothing else: whether the helper also
- * terminated cleanly is its caller's decision. Every problem is fixed wording that names a field,
+ * Reads one control file through `read-control-file.py`, trusting the result only when the helper
+ * terminated cleanly and its one line validates. Every problem is fixed wording that names a field,
  * never a value, so nothing from the helper's output — or the file behind it — is echoed.
  */
 
@@ -112,4 +118,63 @@ export const parseControlResult = (stdout: string, cap: number): ControlResult =
   if (bytes.toString('base64') !== encoded) return unusable('base64 is not canonical');
   if (bytes.length > cap) return unusable('the bytes exceed the cap');
   return Object.freeze({ kind: 'read', bytes });
+};
+
+/** Located beside this module: `src/` in tests, `dist/` once built. */
+export const CONTROL_HELPER = fileURLToPath(new URL('./read-control-file.py', import.meta.url));
+
+/**
+ * Room for everything on the helper's line except the base64 itself. The largest such line is a
+ * refusal with the longest reason, an errno and two close diagnostics, in `json.dumps` spacing:
+ * well under 300 bytes, which a test checks rather than assumes.
+ */
+export const ENVELOPE_BYTES = 512;
+export const maxOutputBytesFor = (cap: number): number => 4 * Math.ceil(cap / 3) + ENVELOPE_BYTES;
+
+export interface ControlReadOptions {
+  readonly deadline: number;
+  readonly cap: number;
+  readonly python?: string;
+  readonly spawn?: typeof nodeSpawn;
+  readonly now?: () => number;
+}
+
+const validName = (name: unknown): boolean =>
+  typeof name === 'string' && name !== '' && name !== '.' && name !== '..' && !/[/\\\0]/.test(name);
+
+export const readControlFile = async (
+  controlDir: string,
+  name: string,
+  options: ControlReadOptions,
+): Promise<ControlResult> => {
+  // read once: a caller changing the object while the helper runs must not move the cap it checks
+  const { deadline, cap, python, spawn, now } = options;
+  if (typeof controlDir !== 'string' || !controlDir.startsWith('/') || controlDir.includes('\0'))
+    return unusable('the control directory must be an absolute path without NUL');
+  if (!validName(name)) return unusable('the name must be a single path component');
+  if (!Number.isSafeInteger(cap) || cap < 1 || cap > MAX_CAP)
+    return unusable('the cap must be a safe integer from 1 to MAX_CAP');
+  if (!Number.isFinite(deadline)) return unusable('the deadline must be finite');
+
+  const outcome = await runChild(
+    python ?? 'python3',
+    [CONTROL_HELPER, '--dir', controlDir, '--name', name, '--cap', String(cap)],
+    {
+      deadline,
+      termGraceMs: 200,
+      killGraceMs: 200,
+      spawn: spawn ?? nodeSpawn,
+      now: now ?? Date.now,
+      maxOutputBytes: maxOutputBytesFor(cap),
+    },
+  );
+  const termination = helperTermination(outcome);
+  const parsed = parseControlResult(termination.stdout, cap);
+  if (termination.problems.length === 0) return parsed;
+  // never bytes from a helper that did not terminate cleanly, however valid its line looked
+  const parserProblems = parsed.kind === 'unusable' ? parsed.problems : [];
+  return Object.freeze({
+    kind: 'unusable',
+    problems: Object.freeze([...termination.problems, ...parserProblems]),
+  });
 };
