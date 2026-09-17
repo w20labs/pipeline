@@ -44,4 +44,25 @@ describe('the built package', () => {
       text: 'built\n',
     });
   }, 30_000);
+
+  it('finds and runs the snapshot helper from an unrelated working directory', async () => {
+    const root = mkdtempSync(join(scratch, 'snapshot-root-'));
+    writeFileSync(join(root, 'f.jsonl'), 'built\n');
+    const script = `
+      const { takeSnapshot, SNAPSHOT_HELPER } = await import(${JSON.stringify(pathToFileURL(join(built, 'snapshot.js')).href)});
+      const s = await takeSnapshot(${JSON.stringify(root)}, { deadline: Date.now() + 10000, cap: 10, maxOutputBytes: 100000, maxLineBytes: 4096 });
+      process.stdout.write(JSON.stringify({ helper: SNAPSHOT_HELPER, complete: s.complete, paths: s.entries.map((e) => e.path), problems: s.problems }));
+    `;
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ['--input-type=module', '-e', script],
+      { cwd: mkdtempSync(join(scratch, 'cwd-')), timeout: 20_000 },
+    );
+    expect(JSON.parse(stdout)).toEqual({
+      helper: join(built, 'snapshot-tree.py'),
+      complete: true,
+      paths: ['f.jsonl'],
+      problems: [],
+    });
+  }, 30_000);
 });
