@@ -27,6 +27,8 @@ export interface Evidence {
   readonly stdout: string;
   readonly stderr: string;
   readonly signalled: readonly Signalled[];
+  /** Present when the output outgrew `maxOutputBytes`: what is here is a prefix, never the whole. */
+  readonly outputExceeded?: true;
 }
 
 interface Ended {
@@ -36,7 +38,7 @@ interface Ended {
 }
 
 export type ChildOutcome =
-  /** The deadline had already passed. Nothing was spawned. */
+  /** Nothing was spawned: the deadline had already passed, or an option was invalid. */
   | { readonly kind: 'not_started'; readonly detail: string }
   /** It never ran: a synchronous throw from `spawn`, or an asynchronous error before it started. */
   | { readonly kind: 'spawn_failed'; readonly detail: string; readonly evidence: Evidence }
@@ -51,8 +53,9 @@ export type ChildOutcome =
       readonly evidence: Evidence;
     }
   /**
-   * The tracked process exited, but its streams were still open at the deadline — something it left
-   * behind is holding them. Termination is confirmed; the output is not complete.
+   * The process was observed to end — an `exit` or `close` event, never an overflow alone — but its
+   * output is not complete: its streams were still held open at the deadline, or it outgrew
+   * `maxOutputBytes`, which is then recorded in the evidence.
    */
   | {
       readonly kind: 'exited';
@@ -76,6 +79,13 @@ export interface ChildOptions {
   readonly now: () => number;
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Raw bytes of stdout and stderr together that are retained; exactly this many is allowed. One byte
+   * more marks the output exceeded, keeps only the budget, and terminates the child at once: SIGTERM
+   * immediately, SIGKILL after `termGraceMs` — never later than the deadline's reserved kill window.
+   * Omitted, output is unbounded, as before.
+   */
+  readonly maxOutputBytes?: number;
 }
 
 export const runChild = async (
@@ -86,13 +96,22 @@ export const runChild = async (
   const { deadline, now } = options;
   if (deadline - now() <= 0)
     return { kind: 'not_started', detail: 'the deadline had already passed; nothing was spawned' };
+  const budget = options.maxOutputBytes;
+  if (budget !== undefined && !(Number.isSafeInteger(budget) && budget >= 0))
+    return { kind: 'not_started', detail: 'maxOutputBytes must be a non-negative safe integer' };
 
   // One streaming decoder per stream: a multi-byte character split across two chunks is only whole
   // once both halves have been seen, and the two streams interleave independently.
   const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') };
   const text = { stdout: '', stderr: '' };
   const signalled: Signalled[] = [];
-  const evidence = (): Evidence => ({ ...text, signalled: [...signalled] });
+  let retained = 0;
+  let exceeded = false;
+  const evidence = (): Evidence => ({
+    ...text,
+    signalled: [...signalled],
+    ...(exceeded ? { outputExceeded: true as const } : {}),
+  });
 
   let child: ChildProcess;
   try {
@@ -115,9 +134,23 @@ export const runChild = async (
   const waiters = new Set<() => void>();
   const wake = (): void => [...waiters].forEach((check) => check());
 
+  /** Counts raw bytes across both streams together, keeping at most the budget. */
+  const take = (stream: 'stdout' | 'stderr', chunk: Buffer): void => {
+    if (exceeded) return; // past the budget nothing more is kept
+    if (budget === undefined || retained + chunk.length <= budget) {
+      retained += chunk.length;
+      text[stream] += decoders[stream].write(chunk);
+      return;
+    }
+    const room = budget - retained;
+    if (room > 0) text[stream] += decoders[stream].write(chunk.subarray(0, room));
+    retained = budget;
+    exceeded = true;
+    wake(); // the first wait ends now, so termination begins at once
+  };
   const capture = {
-    stdout: (chunk: Buffer) => (text.stdout += decoders.stdout.write(chunk)),
-    stderr: (chunk: Buffer) => (text.stderr += decoders.stderr.write(chunk)),
+    stdout: (chunk: Buffer) => take('stdout', chunk),
+    stderr: (chunk: Buffer) => take('stderr', chunk),
   };
   for (const stream of ['stdout', 'stderr'] as const) child[stream]?.on('data', capture[stream]);
 
@@ -147,8 +180,11 @@ export const runChild = async (
     wake();
   });
   function onClose(exitCode: number | null, signal: NodeJS.Signals | null): void {
-    text.stdout += decoders.stdout.end();
-    text.stderr += decoders.stderr.end();
+    // a character cut off by the budget stays cut off, rather than becoming a replacement character
+    if (!exceeded) {
+      text.stdout += decoders.stdout.end();
+      text.stderr += decoders.stderr.end();
+    }
     closed = { at: now(), exitCode, signal };
     wake();
   }
@@ -182,8 +218,10 @@ export const runChild = async (
   const settle = async (): Promise<ChildOutcome> => {
     if (failure !== undefined)
       return { kind: 'spawn_failed', detail: failure, evidence: evidence() };
-    await waitUntil(deadline, () => closed !== undefined);
-    if (closed !== undefined)
+    // An overflowed capture is incomplete however the streams end, so their close is not awaited —
+    // including when the overflow arrives only while this wait is already under way.
+    if (!exceeded) await waitUntil(deadline, () => closed !== undefined || exceeded);
+    if (closed !== undefined && !exceeded)
       return {
         kind: 'closed',
         closedAt: closed.at,
@@ -192,7 +230,7 @@ export const runChild = async (
         signal: closed.signal,
         evidence: evidence(),
       };
-    const ended = exited as Ended;
+    const ended = (exited ?? closed) as Ended;
     const partial = evidence();
     release();
     return {
@@ -219,10 +257,14 @@ export const runChild = async (
   // Each phase rechecks the child's state after its wait resumes, immediately before signalling: a
   // wait that answered "not yet" can be stale by the time the await returns, and a signal to a child
   // that has already ended would reach whatever reused its pid.
-  await waitUntil(deadline - options.termGraceMs - options.killGraceMs, gone);
+  await waitUntil(deadline - options.termGraceMs - options.killGraceMs, () => gone() || exceeded);
   if (gone()) return settle();
   send('SIGTERM');
-  await waitUntil(deadline - options.killGraceMs, gone);
+  // After an overflow, SIGTERM's grace runs from now — never past the reserved kill window.
+  const killAt = exceeded
+    ? Math.min(now() + options.termGraceMs, deadline - options.killGraceMs)
+    : deadline - options.killGraceMs;
+  await waitUntil(killAt, gone);
   if (gone()) return settle();
   send('SIGKILL');
   await waitUntil(deadline, gone);

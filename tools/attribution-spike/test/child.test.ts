@@ -50,13 +50,14 @@ const harness = (behaviour: { throws?: Error } = {}) => {
     child = new StubChild();
     return child;
   }) as unknown as typeof spawn;
-  const run = (deadline: number) =>
+  const run = (deadline: number, maxOutputBytes?: number) =>
     runChild('herdr', ['agent', 'read'], {
       deadline,
       termGraceMs: TERM,
       killGraceMs: KILL,
       spawn: spawnStub,
       now: () => Date.now(),
+      ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }),
     });
   return { run, child: () => child as StubChild, spawns: () => spawns };
 };
@@ -436,5 +437,161 @@ describe('a budget with no room left for its phases', () => {
         ],
       },
     });
+  });
+});
+
+describe('bounding captured output', () => {
+  const D = T0 + 10_000;
+  const out = (h: ReturnType<typeof harness>, stream: 'stdout' | 'stderr', text: string | Buffer) =>
+    h.child()[stream].emit('data', Buffer.from(text));
+
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 2])(
+    'refuses a limit of %s without spawning',
+    async (limit) => {
+      const h = harness();
+      expect(await h.run(D, limit)).toEqual({
+        kind: 'not_started',
+        detail: 'maxOutputBytes must be a non-negative safe integer',
+      });
+      expect(h.spawns()).toBe(0);
+    },
+  );
+
+  it('allows output of exactly the limit, as complete', async () => {
+    const h = harness();
+    const work = h.run(D, 5);
+    out(h, 'stdout', 'abcde');
+    h.child().finish(0);
+    const result = await work;
+    expect(result).toMatchObject({ kind: 'closed', evidence: { stdout: 'abcde' } });
+    expect(result).not.toHaveProperty('evidence.outputExceeded');
+  });
+
+  it('with a zero budget, empty output still completes', async () => {
+    const h = harness();
+    const work = h.run(D, 0);
+    h.child().finish(0);
+    expect(await work).toMatchObject({ kind: 'closed', exitCode: 0 });
+  });
+
+  it('with a zero budget, the first byte overflows and nothing is kept', async () => {
+    const h = harness();
+    const state = track(h.run(D, 0));
+    h.child().onSignal = () => h.child().finish(null, 'SIGTERM');
+    out(h, 'stdout', 'x');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.outcome).toMatchObject({
+      kind: 'exited',
+      outputComplete: false,
+      evidence: { stdout: '', outputExceeded: true },
+    });
+  });
+
+  it('keeps only the budget of an oversized chunk, and sends SIGTERM at once', async () => {
+    const h = harness();
+    const state = track(h.run(D, 5));
+    out(h, 'stdout', 'abcdefgh');
+    await vi.advanceTimersByTimeAsync(0);
+    // at the overflow, not at the deadline less both graces
+    expect(h.child().kills).toEqual(['SIGTERM']);
+    expect(state.outcome).toBeUndefined(); // a delivered signal is not an exit
+    out(h, 'stdout', 'more'); // nothing past the budget is kept, on either stream
+    out(h, 'stderr', 'more');
+    h.child().finish(null, 'SIGTERM');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.outcome).toMatchObject({
+      kind: 'exited',
+      exitedAt: T0,
+      signal: 'SIGTERM',
+      outputComplete: false,
+      evidence: { stdout: 'abcde', outputExceeded: true },
+    });
+  });
+
+  it.each([
+    ['stdout first', 'stdout', 'stderr', { stdout: 'abc', stderr: 'xy' }],
+    ['stderr first', 'stderr', 'stdout', { stderr: 'abc', stdout: 'xy' }],
+  ] as const)('counts both streams against one budget, %s', async (_label, first, second, kept) => {
+    const h = harness();
+    const work = h.run(D, 5);
+    h.child().onSignal = () => h.child().finish(null, 'SIGTERM');
+    out(h, first, 'abc');
+    out(h, second, 'xyz');
+    expect(await work).toMatchObject({ evidence: { ...kept, outputExceeded: true } });
+  });
+
+  it('never splits a multibyte character into a replacement character at the limit', async () => {
+    const h = harness();
+    const work = h.run(D, 3);
+    h.child().onSignal = () => h.child().finish(null, 'SIGTERM');
+    out(h, 'stdout', Buffer.concat([Buffer.from('a'), Buffer.from('😀')])); // 1 + 4 bytes
+    const result = await work;
+    expect(result).toMatchObject({ evidence: { stdout: 'a', outputExceeded: true } });
+    expect((result as { evidence: { stdout: string } }).evidence.stdout).not.toContain('\uFFFD');
+  });
+
+  it('sends no signal when the child exits in the same moment it overflows, and stays incomplete', async () => {
+    const h = harness();
+    const work = h.run(D, 5);
+    out(h, 'stdout', 'abcdefgh');
+    h.child().finish(0); // exit and a normal close, before anything could be signalled
+    const result = await work;
+    expect(h.child().kills).toEqual([]);
+    expect(result).toMatchObject({
+      kind: 'exited',
+      exitCode: 0,
+      outputComplete: false,
+      evidence: { stdout: 'abcde', outputExceeded: true },
+    });
+  });
+
+  it('stops waiting for close when a descendant overflows the pipe after the child has exited', async () => {
+    const h = harness();
+    const state = track(h.run(D, 5));
+    h.child().emit('exit', 0, null); // the tracked process is gone; something still holds its stdout
+    await vi.advanceTimersByTimeAsync(100); // the wait for close is now under way
+    expect(state.outcome).toBeUndefined();
+    out(h, 'stdout', 'abcdefgh'); // the descendant overflows, and nothing ever closes
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.outcome).toMatchObject({
+      kind: 'exited',
+      exitedAt: T0,
+      exitCode: 0,
+      outputComplete: false,
+      evidence: { stdout: 'abcde', outputExceeded: true },
+    });
+    expect(h.child().kills).toEqual([]); // an exited pid is never signalled
+    expect(h.child().stdout.destroyed && h.child().stderr.destroyed).toBe(true); // capture released
+  });
+
+  it('escalates to SIGKILL one term grace after an early overflow, and never reports an exit it did not see', async () => {
+    const h = harness();
+    const state = track(h.run(D, 5));
+    await vi.advanceTimersByTimeAsync(2_000);
+    out(h, 'stdout', 'abcdefgh'); // overflow at T0+2000, long before the timed SIGTERM at D-1500
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.child().kills).toEqual(['SIGTERM']);
+    await vi.advanceTimersByTimeAsync(TERM - 1);
+    expect(h.child().kills).toEqual(['SIGTERM']);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.child().kills).toEqual(['SIGTERM', 'SIGKILL']); // at T0+3000, not at D-500
+    await vi.advanceTimersByTimeAsync(D - (T0 + 3_000));
+    // it never exited: the overflow alone is not an end
+    expect(state.outcome).toMatchObject({
+      kind: 'unterminated',
+      at: D,
+      evidence: { outputExceeded: true },
+    });
+  });
+
+  it('never sends SIGKILL later than the reserved kill window, however late the overflow', async () => {
+    const h = harness();
+    const state = track(h.run(D, 5));
+    await vi.advanceTimersByTimeAsync(10_000 - KILL - 200); // inside SIGTERM's grace already
+    out(h, 'stdout', 'abcdefgh');
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.child().kills).toEqual(['SIGTERM', 'SIGKILL']); // at D-500, the window's edge
+    await vi.advanceTimersByTimeAsync(KILL);
+    expect(state.outcome).toMatchObject({ kind: 'unterminated', at: D });
   });
 });
