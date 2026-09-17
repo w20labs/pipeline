@@ -33,7 +33,10 @@ REASON (release): arguments, capability, directory_missing, directory_unusable, 
   not_regular, fstat_failed, read_failed, too_large, stat_failed, unlink_failed.
 Anything but "released" leaves the file exactly as found: same bytes, inode and type.
 DIAGNOSTIC: {"step": str, "errno": str|null}, step one of close_temp, unlink_temp, temp_replaced,
-  temp_may_remain, close_directory. `acquired` with diagnostics still means the lock is held: the
+  temp_may_remain, close_directory, close_lock, or — from release's cleanup of this run's own
+  leftover temporary file — temp_unusable, temp_fstat_failed, temp_read_failed, temp_too_large,
+  temp_partial, temp_unrecognized, temp_stat_failed, temp_unlink_failed, temp_close_failed.
+  Diagnostics accumulate; none of them changes the outcome. `acquired` with diagnostics still means the lock is held: the
   caller must release it, and must keep the diagnostics.
 """
 
@@ -165,21 +168,14 @@ def read_whole(fd, cap):
     return (None, refused("too_large")) if len(data) > cap else (bytes(data), None)
 
 
-def release(directory, record, held, diagnostics):
+def release_lock(record, dir_fd, held):
     """Remove run.lock, but only while it is still the whole record this run's token published.
 
     RACE: between the device and inode recheck and the unlink, the name could still be replaced, so
     the unlink could remove a different file. POSIX offers no unlink-by-descriptor to close that
     window. Under the cooperative assumptions it cannot arise; outside them the recheck narrows it.
     """
-    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     lock_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-    try:
-        held.append(("close_directory", os.open(directory, dir_flags)))
-    except OSError as error:
-        kind = "directory_missing" if error.errno == errnos.ENOENT else "directory_unusable"
-        return refused(kind, error)
-    dir_fd = held[0][1]
     try:
         fd = os.open("run.lock", lock_flags, dir_fd=dir_fd)
     except OSError as error:
@@ -215,6 +211,75 @@ def release(directory, record, held, diagnostics):
     except OSError as error:
         return refused("unlink_failed", error)
     return {"kind": "released"}
+
+
+
+
+def drop_leftover(temp, token, dir_fd, diagnostics):
+    """Remove a temporary file this run left behind — and nothing else.
+
+    Only a regular file holding a whole record with this run's token is removed, and only while its
+    device and inode still match what was read. Anything else is left exactly as found and reported.
+    Diagnostics accumulate: a close failure is added beside whatever was already reported.
+    """
+    temp_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    def note(step, error=None):
+        diagnostics.append({"step": step, "errno": None if error is None else name_of(error)})
+    try:
+        fd = os.open(temp, temp_flags, dir_fd=dir_fd)
+    except OSError as error:
+        return None if error.errno == errnos.ENOENT else note("temp_unusable", error)
+    try:
+        try:
+            owned = os.fstat(fd)
+        except OSError as error:
+            return note("temp_fstat_failed", error)
+        if not stat.S_ISREG(owned.st_mode):
+            return note("temp_unusable")
+        data, failure = read_whole(fd, MAX_INPUT)
+        if failure is not None:
+            too_large = failure["reason"] == "too_large"
+            return diagnostics.append(
+                {"step": "temp_too_large" if too_large else "temp_read_failed", "errno": failure["errno"]}
+            )
+        left = lock_record(data)
+        if left is None:
+            return note("temp_partial")
+        if left["token"] != token:
+            return note("temp_unrecognized")
+        try:
+            now = os.stat(temp, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError as error:
+            return note("temp_stat_failed", error)
+        if (now.st_dev, now.st_ino) != (owned.st_dev, owned.st_ino):
+            return note("temp_replaced")
+        try:
+            os.unlink(temp, dir_fd=dir_fd)
+        except OSError as error:
+            note("temp_unlink_failed", error)
+    finally:
+        try:
+            os.close(fd)
+        except OSError as error:
+            note("temp_close_failed", error)
+
+
+def release(directory, record, held, diagnostics):
+    """Anchor the directory, release the lock, then clean up this run's own leftover file.
+
+    Cleanup runs only once the directory is anchored, so a refusal for arguments, a capability or the
+    directory itself touches nothing. Whatever it finds is a diagnostic: the outcome stays the lock's.
+    """
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        held.append(("close_directory", os.open(directory, dir_flags)))
+    except OSError as error:
+        kind = "directory_missing" if error.errno == errnos.ENOENT else "directory_unusable"
+        return refused(kind, error)
+    dir_fd = held[0][1]
+    outcome = release_lock(record, dir_fd, held)
+    drop_leftover("run.lock.tmp-" + record["nonce"], record["token"], dir_fd, diagnostics)
+    return outcome
 
 
 def write_all(fd, data):

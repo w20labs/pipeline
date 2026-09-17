@@ -1017,4 +1017,128 @@ describe('taking the run lock', () => {
       expect(logged(stderr)).toEqual([]);
     });
   });
+
+  describe('and clearing up after itself', () => {
+    const OTHER = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const release = (
+      dir: string,
+      input: string | Uint8Array = JSON.stringify(RECORD),
+      python?: string,
+    ) => acquire(dir, input, python, 'release');
+    const asFound = (path: string) => {
+      const info = lstatSync(path);
+      return {
+        ino: info.ino,
+        type: info.mode & 0o170000,
+        ...(info.isFile() ? { bytes: readFileSync(path, 'utf8') } : {}),
+        ...(info.isSymbolicLink() ? { points: readlinkSync(path) } : {}),
+      };
+    };
+    const tempPath = (c: Control) => join(c.dir, TEMP);
+    /** A lock held by this run, and a leftover temporary file holding whatever is given. */
+    const withLeftover = async (c: Control, contents?: string) => {
+      expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+      if (contents !== undefined) writeFileSync(tempPath(c), contents);
+    };
+    const OURS = JSON.stringify(RECORDED);
+    const THEIRS = JSON.stringify({ ...RECORDED, runId: 'run-2', token: OTHER });
+
+    it('removes a leftover file holding its own record', async () => {
+      const c = control();
+      await withLeftover(c, OURS);
+      expect((await release(c.dir)).result).toEqual({ kind: 'released', diagnostics: [] });
+      expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+    });
+
+    it.each([
+      ['another run’s record', THEIRS, 'temp_unrecognized'],
+      ['a truncated record', OURS.slice(0, 40), 'temp_partial'],
+      ['more than the cap', `${OURS}${' '.repeat(4_097 - OURS.length)}`, 'temp_too_large'],
+    ])('leaves a leftover file holding %s, reporting it', async (_label, contents, step) => {
+      const c = control();
+      await withLeftover(c, contents);
+      const before = asFound(tempPath(c));
+      const { result } = await release(c.dir);
+      expect(result).toEqual({ kind: 'released', diagnostics: [{ step, errno: null }] });
+      expect(asFound(tempPath(c))).toEqual(before);
+    });
+
+    it('removes a leftover record padded to exactly the cap, through one-byte reads', async () => {
+      const c = control();
+      await withLeftover(c, `${OURS}${' '.repeat(4_096 - OURS.length)}`);
+      const shim = shimmed(
+        c.base,
+        'python3-temp-short-reads',
+        'real_read = os.read\nos.read = lambda fd, n: real_read(fd, 1)',
+      );
+      expect((await release(c.dir, JSON.stringify(RECORD), shim)).result).toEqual({
+        kind: 'released',
+        diagnostics: [],
+      });
+      expect(entries(c.dir).temp).toBeUndefined();
+    });
+
+    it('never follows a symlinked leftover name, nor reads its target', async () => {
+      const c = control();
+      await withLeftover(c);
+      const target = join(c.base, 'temp-target');
+      writeFileSync(target, OURS); // a record it would accept, if it followed the link
+      symlinkSync(target, tempPath(c));
+      const [beforeLink, beforeTarget] = [asFound(tempPath(c)), asFound(target)];
+      const { result } = await release(c.dir);
+      expect(result).toEqual({
+        kind: 'released',
+        diagnostics: [{ step: 'temp_unusable', errno: 'ELOOP' }],
+      });
+      expect(asFound(tempPath(c))).toEqual(beforeLink);
+      expect(asFound(target)).toEqual(beforeTarget);
+    });
+
+    it.each([
+      ['a directory', (c: Control) => mkdirSync(tempPath(c))],
+      ['a FIFO with no writer', (c: Control) => execFileSync('mkfifo', [tempPath(c)])],
+    ])('leaves a leftover name that is %s, reporting it', async (_label, arrange) => {
+      const c = control();
+      await withLeftover(c);
+      arrange(c);
+      const before = asFound(tempPath(c));
+      const started = Date.now();
+      const { result } = await release(c.dir);
+      expect(result).toEqual({
+        kind: 'released',
+        diagnostics: [{ step: 'temp_unusable', errno: null }],
+      });
+      expect(Date.now() - started).toBeLessThan(3_000); // the open never blocks on the FIFO
+      expect(asFound(tempPath(c))).toEqual(before);
+    });
+
+    it('will not remove a leftover file replaced after it was read', async () => {
+      const c = control();
+      await withLeftover(c, OURS);
+      const intruder = join(c.base, 'intruder-temp');
+      writeFileSync(intruder, 'another file');
+      // swapped once the temporary file's own bytes have been read, before the recheck
+      const patch = [
+        'real_read = os.read',
+        'reads = []',
+        'def reading(fd, n):',
+        '    data = real_read(fd, n)',
+        '    if data: reads.append(fd)',
+        '    if len(reads) == 2 and reads[0] != reads[1]:  # the lock first, then the leftover file',
+        `        reads.append(fd); os.replace(${JSON.stringify(intruder)}, ${JSON.stringify(tempPath(c))})`,
+        '    return data',
+        'os.read = reading',
+      ].join('\n');
+      const shim = shimmed(c.base, 'python3-swap-temp-late', patch);
+      const { result } = await release(c.dir, JSON.stringify(RECORD), shim);
+      expect(result).toMatchObject({ diagnostics: [{ step: 'temp_replaced', errno: null }] });
+      expect(asFound(tempPath(c))).toMatchObject({ bytes: 'another file' });
+    });
+
+    it('says nothing when there is no leftover file', async () => {
+      const c = control();
+      await withLeftover(c);
+      expect((await release(c.dir)).result).toEqual({ kind: 'released', diagnostics: [] });
+    });
+  });
 });
