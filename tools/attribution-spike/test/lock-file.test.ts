@@ -1,6 +1,12 @@
-import { type ChildProcess, spawn as nodeSpawn, type spawn } from 'node:child_process';
+import {
+  type ChildProcess,
+  execFileSync,
+  spawn as nodeSpawn,
+  type spawn,
+} from 'node:child_process';
 import {
   lstatSync,
+  readlinkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -627,10 +633,19 @@ describe('taking the run lock', () => {
       input: string | Uint8Array = JSON.stringify(RECORD),
       python?: string,
     ) => acquire(dir, input, python, 'release');
-    /** Bytes, inode and type: reading a file updates its access time, which proves nothing here. */
+    /**
+     * What must not change: inode and type always, plus the contents of what can be read without
+     * blocking — a regular file's bytes, a symlink's text. A FIFO is never opened to check it.
+     */
     const asFound = (path: string) => {
       const info = lstatSync(path);
-      return { bytes: readFileSync(path, 'utf8'), ino: info.ino, type: info.mode & 0o170000 };
+      const type = info.mode & 0o170000;
+      return {
+        ino: info.ino,
+        type,
+        ...(info.isFile() ? { bytes: readFileSync(path, 'utf8') } : {}),
+        ...(info.isSymbolicLink() ? { points: readlinkSync(path) } : {}),
+      };
     };
     const locked = async (c: Control) => {
       expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
@@ -748,6 +763,258 @@ describe('taking the run lock', () => {
       const before = lstatSync(join(c.dir, 'run.lock')).ino;
       expect((await release(c.dir)).result).toEqual({ kind: 'unrecognized', diagnostics: [] });
       expect(lstatSync(join(c.dir, 'run.lock')).ino).toBe(before);
+    });
+  });
+
+  describe('and refusing to release what is not exactly its own', () => {
+    const OTHER = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const release = (
+      dir: string,
+      input: string | Uint8Array = JSON.stringify(RECORD),
+      python?: string,
+    ) => acquire(dir, input, python, 'release');
+    const asFound = (path: string) => {
+      const info = lstatSync(path);
+      return {
+        ino: info.ino,
+        type: info.mode & 0o170000,
+        ...(info.isFile() ? { bytes: readFileSync(path, 'utf8') } : {}),
+        ...(info.isSymbolicLink() ? { points: readlinkSync(path) } : {}),
+      };
+    };
+    const lockPath = (c: Control) => join(c.dir, 'run.lock');
+
+    it('reads no more than the cap allows, and releases a record padded to exactly it', async () => {
+      const c = control();
+      const body = JSON.stringify(RECORDED);
+      writeFileSync(lockPath(c), body + ' '.repeat(4_096 - body.length));
+      const counting = [
+        'import json',
+        'real_read = os.read',
+        'def counted(fd, n):',
+        '    sys.stderr.write(json.dumps(n) + "\\n")  # what it asked for, not what it got',
+        '    return real_read(fd, n)',
+        'os.read = counted',
+      ].join('\n');
+      const shim = shimmed(c.base, 'python3-counting-read', counting);
+      const { result, stderr } = await release(c.dir, JSON.stringify(RECORD), shim);
+      expect(result).toEqual({ kind: 'released', diagnostics: [] });
+      const asked = stderr.split('\n').flatMap((l) => (l === '' ? [] : [Number(l)]));
+      expect(asked.length).toBeGreaterThan(0);
+      expect(Math.max(...asked)).toBeLessThanOrEqual(4_097); // never asks past the cap + 1
+    });
+
+    it('refuses a lock one byte over the cap, leaving it as found', async () => {
+      const c = control();
+      const body = JSON.stringify(RECORDED);
+      writeFileSync(lockPath(c), body + ' '.repeat(4_097 - body.length));
+      const before = asFound(lockPath(c));
+      expect((await release(c.dir)).result).toEqual(refused('too_large'));
+      expect(asFound(lockPath(c))).toEqual(before);
+    });
+
+    it('releases through one-byte reads', async () => {
+      const c = control();
+      expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+      const shim = shimmed(
+        c.base,
+        'python3-short-reads',
+        'real_read = os.read\nos.read = lambda fd, n: real_read(fd, 1)',
+      );
+      expect((await release(c.dir, JSON.stringify(RECORD), shim)).result).toEqual({
+        kind: 'released',
+        diagnostics: [],
+      });
+      expect(entries(c.dir).lock).toBeUndefined();
+    });
+
+    it.each([
+      ['a directory', (c: Control) => mkdirSync(lockPath(c))],
+      ['a FIFO with no writer', (c: Control) => execFileSync('mkfifo', [lockPath(c)])],
+    ])('refuses a lock that is %s, leaving it as found', async (_label, arrange) => {
+      const c = control();
+      arrange(c);
+      const before = asFound(lockPath(c));
+      const started = Date.now();
+      expect((await release(c.dir)).result).toEqual(refused('not_regular'));
+      expect(Date.now() - started).toBeLessThan(3_000); // the open never blocks on the FIFO
+      expect(asFound(lockPath(c))).toEqual(before);
+    });
+
+    it('refuses a symlinked lock without reading through it', async () => {
+      const c = control();
+      const target = join(c.base, 'target');
+      writeFileSync(target, JSON.stringify(RECORDED)); // a record it would accept, if it followed
+      symlinkSync(target, lockPath(c));
+      const [beforeLink, beforeTarget] = [asFound(lockPath(c)), asFound(target)];
+      const { result } = await release(c.dir);
+      expect(result).toMatchObject({ kind: 'refused', reason: 'lock_unusable' });
+      expect(asFound(lockPath(c))).toEqual(beforeLink);
+      expect(asFound(target)).toEqual(beforeTarget);
+    });
+
+    /** Replaces run.lock once its bytes have been read, before the recheck can run. */
+    const swapAfterRead = (make: string) =>
+      [
+        'real_read = os.read',
+        'swapped = []',
+        'def reading(fd, n):',
+        '    data = real_read(fd, n)',
+        '    if data and not swapped:',
+        '        swapped.append(True)',
+        `        ${make}`,
+        '    return data',
+        'os.read = reading',
+      ].join('\n');
+
+    it('will not release a lock replaced after it was read', async () => {
+      const c = control();
+      expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+      const intruder = join(c.base, 'intruder');
+      writeFileSync(intruder, 'another run');
+      const patch = swapAfterRead(
+        `os.replace(${JSON.stringify(intruder)}, ${JSON.stringify(lockPath(c))})`,
+      );
+      const shim = shimmed(c.base, 'python3-swap-lock', patch);
+      const { result } = await release(c.dir, JSON.stringify(RECORD), shim);
+      expect(result).toEqual({ kind: 'replaced', diagnostics: [] });
+      expect(asFound(lockPath(c))).toMatchObject({ bytes: 'another run' });
+    });
+
+    it('will not release a lock replaced by a symlink to its own inode', async () => {
+      const c = control();
+      expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+      const kept = join(c.base, 'kept');
+      // the very same inode, under another name: only a recheck that refuses to follow links refuses
+      const patch = swapAfterRead(
+        `os.link(${JSON.stringify(lockPath(c))}, ${JSON.stringify(kept)}); os.unlink(${JSON.stringify(lockPath(c))}); os.symlink(${JSON.stringify(kept)}, ${JSON.stringify(lockPath(c))})`,
+      );
+      const shim = shimmed(c.base, 'python3-swap-symlink', patch);
+      const { result } = await release(c.dir, JSON.stringify(RECORD), shim);
+      expect(result).toEqual({ kind: 'replaced', diagnostics: [] });
+      expect(asFound(lockPath(c))).toMatchObject({ points: kept });
+      expect(JSON.parse(readFileSync(kept, 'utf8'))).toEqual(RECORDED); // the record itself survives
+    });
+
+    const failing = (target: string, code: string, when = 'True') =>
+      [
+        `real_${target} = os.${target}`,
+        `def failing_${target}(*a, **k):`,
+        `    if ${when}: raise OSError(errno.${code}, os.strerror(errno.${code}))`,
+        `    return real_${target}(*a, **k)`,
+        `os.${target} = failing_${target}`,
+        `if real_${target} in os.supports_dir_fd: os.supports_dir_fd.add(failing_${target})`,
+        `if real_${target} in os.supports_follow_symlinks: os.supports_follow_symlinks.add(failing_${target})`,
+      ].join('\n');
+
+    it.each([
+      ['fstat', failing('fstat', 'EIO'), refused('fstat_failed', 'EIO')],
+      ['the read', failing('read', 'EIO', 'a[0] > 2'), refused('read_failed', 'EIO')],
+      [
+        'the recheck',
+        failing('stat', 'EIO', 'k.get("dir_fd") is not None'),
+        refused('stat_failed', 'EIO'),
+      ],
+      ['the unlink', failing('unlink', 'EACCES'), refused('unlink_failed', 'EACCES')],
+    ])('refuses when %s fails, leaving the lock as found', async (_label, patch, expected) => {
+      const c = control();
+      expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+      const before = asFound(lockPath(c));
+      const shim = shimmed(c.base, `python3-${String(made.length)}-release-fail`, patch);
+      expect((await release(c.dir, JSON.stringify(RECORD), shim)).result).toEqual(expected);
+      expect(asFound(lockPath(c))).toEqual(before);
+    });
+
+    const TRACK_LOCK = [
+      'locks = []',
+      'real_open = os.open',
+      'def tracking_open(path, flags, *a, **k):',
+      '    fd = real_open(path, flags, *a, **k)',
+      '    if k.get("dir_fd") is not None: locks.append(fd)',
+      '    return fd',
+      'os.open = tracking_open',
+      'os.supports_dir_fd.add(tracking_open)',
+    ].join('\n');
+    const closeFails = (which: 'lock' | 'directory') =>
+      [
+        TRACK_LOCK,
+        'real_close = os.close',
+        'def failing_close(fd):',
+        '    real_close(fd)',
+        `    if ${which === 'lock' ? 'fd in locks' : 'fd not in locks'}: raise OSError(errno.EBADF, "bad")`,
+        'os.close = failing_close',
+      ].join('\n');
+
+    it.each([
+      ['its own lock', 'lock', JSON.stringify(RECORD), { kind: 'released' }, 'close_lock'],
+      [
+        'another run’s lock',
+        'lock',
+        JSON.stringify({ ...RECORD, token: OTHER, nonce: OTHER }),
+        { kind: 'not_ours' },
+        'close_lock',
+      ],
+      [
+        'its own lock',
+        'directory',
+        JSON.stringify(RECORD),
+        { kind: 'released' },
+        'close_directory',
+      ],
+    ] as [string, 'lock' | 'directory', string, object, string][])(
+      'keeps the outcome for %s when the %s descriptor will not close',
+      async (_label, which, input, outcome, step) => {
+        const c = control();
+        expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+        const shim = shimmed(
+          c.base,
+          `python3-${String(made.length)}-close-${which}`,
+          closeFails(which),
+        );
+        const { result } = await release(c.dir, input, shim);
+        expect(result).toEqual({ ...outcome, diagnostics: [{ step, errno: 'EBADF' }] });
+      },
+    );
+
+    it.each([
+      ['a release', () => undefined, JSON.stringify(RECORD)],
+      ['a missing lock', (c: Control) => rmSync(lockPath(c)), JSON.stringify(RECORD)],
+      [
+        'another run’s lock',
+        () => undefined,
+        JSON.stringify({ ...RECORD, token: OTHER, nonce: OTHER }),
+      ],
+      [
+        'an unrecognized lock',
+        (c: Control) => writeFileSync(lockPath(c), 'not a record'),
+        JSON.stringify(RECORD),
+      ],
+    ])(
+      'closes every descriptor it opened, and writes one line, after %s',
+      async (_label, arrange, input) => {
+        const c = control();
+        expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+        arrange(c);
+        const shim = shimmed(c.base, `python3-${String(made.length)}-release-log`, LOG);
+        const { stderr } = await release(c.dir, input, shim);
+        const events = logged(stderr);
+        const opened = events.filter((e) => 'opened' in e).map((e) => e['opened']);
+        expect(opened.length).toBeGreaterThan(0);
+        expect(events.filter((e) => 'close' in e).map((e) => e['close'])).toEqual(
+          [...opened].reverse(),
+        );
+      },
+    );
+
+    it('refuses a malformed token before opening anything, and a Python without a capability', async () => {
+      const c = control();
+      const shim = shimmed(c.base, 'python3-release-cap', `del os.O_NOFOLLOW\n${LOG}`);
+      expect((await release(c.dir, JSON.stringify({ ...RECORD, token: 'nope' }))).result).toEqual(
+        refused('arguments'),
+      );
+      const { result, stderr } = await release(c.dir, JSON.stringify(RECORD), shim);
+      expect(result).toEqual(refused('capability'));
+      expect(logged(stderr)).toEqual([]);
     });
   });
 });
