@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && cp src/read-first-record.py dist/read-first-record.py",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run"
   },
