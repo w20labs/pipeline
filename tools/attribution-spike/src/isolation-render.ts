@@ -1,9 +1,10 @@
 import type { ClassifiedRow } from './isolation.js';
-import type { Finding } from './isolation-report.js';
+import type { Finding, IsolationReport } from './isolation-report.js';
+import type { SessionOwnership } from './session.js';
 import type { DifferenceRow } from './snapshot-diff.js';
 
 /**
- * The isolation finding as exact lines. Fixed wording is written as it is; every string that came
+ * The isolation report as exact lines. Fixed wording is written as it is; every string that came
  * from outside (paths, reasons) is JSON-quoted, with U+2028 and U+2029 escaped as well, so no value
  * can end a line early or forge one of the report's own lines.
  */
@@ -66,3 +67,50 @@ export const renderIsolationFinding = (finding: Finding): readonly string[] => {
     }
   }
 };
+
+/** Outcome kinds in the order they are always listed. */
+const OUTCOMES = ['absent', 'reused', 'leftover', 'unresolved', 'invalid_record'] as const;
+
+export const renderSafeguards = ({
+  lock,
+  records,
+  quiescence,
+}: IsolationReport['safeguards']): readonly string[] => [
+  'Exclusive use: not proven. Safeguards:',
+  ...(lock.held
+    ? [`  - Lock: held at ${quote(lock.path)}`]
+    : [
+        `  - Lock: not held — ${quote(lock.why)}`,
+        ...(lock.cleanupDiagnostics ?? []).map((d) => `      cleanup: ${quote(d)}`),
+        ...(lock.strandedLock === undefined
+          ? []
+          : [`      stranded lock: ${quote(lock.strandedLock)}`]),
+      ]),
+  `  - Harness process records: ${String(records.checked)} checked, launch ${records.launch} (${OUTCOMES.map(
+    (kind) => `${kind} ${String(records.outcomes[kind])}`,
+  ).join(', ')})`,
+  ...(quiescence.quiet
+    ? ['  - Quiescence: no change detected between two complete snapshots']
+    : [
+        `  - Quiescence: not quiet — ${quote(quiescence.why)}`,
+        ...quiescence.rows.map((row) => `      - ${renderDifference(row)}`),
+      ]),
+];
+
+export const renderOwnership = (ownership: SessionOwnership): readonly string[] =>
+  ownership.owned
+    ? [`Ownership: owned — ${quote(ownership.path)} (session ${quote(ownership.sessionId)})`]
+    : [
+        `Ownership: not owned — ${quote(ownership.why)}`,
+        ...(ownership.path === undefined ? [] : [`    path: ${quote(ownership.path)}`]),
+        ...(ownership.diagnostics ?? []).map((d) => `    diagnostic: ${quote(d)}`),
+      ];
+
+/** Finding, safeguards, ownership: in that order, one empty line between sections. */
+export const renderIsolationReport = (report: IsolationReport): readonly string[] => [
+  ...renderIsolationFinding(report.finding),
+  '',
+  ...renderSafeguards(report.safeguards),
+  '',
+  ...renderOwnership(report.ownership),
+];

@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ClassifiedRow } from '../src/isolation.js';
-import type { Finding } from '../src/isolation-report.js';
-import { quote, renderIsolationFinding } from '../src/isolation-render.js';
+import { type ClassifiedRow, classifyChanges, quiescence } from '../src/isolation.js';
+import { type Finding, type IsolationReport, isolationReport } from '../src/isolation-report.js';
+import {
+  quote,
+  renderIsolationFinding,
+  renderIsolationReport,
+  renderOwnership,
+  renderSafeguards,
+} from '../src/isolation-render.js';
+import type { SessionOwnership } from '../src/session.js';
+import type { Snapshot } from '../src/snapshot.js';
 import type { DifferenceRow } from '../src/snapshot-diff.js';
 
 const U = '3f2a9c1e-7b4d-4e8a-9c21-5d6f7a8b9c0d';
@@ -168,4 +176,212 @@ describe('rendering the isolation finding', () => {
     expect(lines.filter((l) => l.startsWith('Isolation:'))).toHaveLength(1);
     expect(lines.join('')).toContain(quote(HOSTILE));
   });
+});
+
+type Safeguards = IsolationReport['safeguards'];
+const RECORDS: Safeguards['records'] = {
+  checked: 15,
+  launch: 'blocked',
+  // distinct counts, so two swapped labels cannot pass
+  outcomes: { absent: 1, reused: 2, leftover: 3, unresolved: 4, invalid_record: 5 },
+};
+const QUIET: Safeguards['quiescence'] = { quiet: true };
+const HELD: Safeguards['lock'] = { held: true, path: '/cfg/.lock' };
+const RECORDS_LINE =
+  '  - Harness process records: 15 checked, launch blocked (absent 1, reused 2, leftover 3, unresolved 4, invalid_record 5)';
+
+describe('rendering safeguards and ownership', () => {
+  it.each([
+    [HELD, ['  - Lock: held at "/cfg/.lock"']],
+    [{ held: false, why: 'held by another run' }, ['  - Lock: not held — "held by another run"']],
+    [
+      {
+        held: false,
+        why: 'write failed',
+        cleanupDiagnostics: ['unlink: EACCES', 'close: EBADF'],
+        strandedLock: '/cfg/.lock',
+      },
+      [
+        '  - Lock: not held — "write failed"',
+        '      cleanup: "unlink: EACCES"',
+        '      cleanup: "close: EBADF"',
+        '      stranded lock: "/cfg/.lock"',
+      ],
+    ],
+  ] as [Safeguards['lock'], string[]][])('renders the lock %o exactly', (lock, lines) => {
+    expect(renderSafeguards({ lock, records: RECORDS, quiescence: QUIET })).toEqual([
+      'Exclusive use: not proven. Safeguards:',
+      ...lines,
+      RECORDS_LINE,
+      '  - Quiescence: no change detected between two complete snapshots',
+    ]);
+  });
+
+  it('renders allowed records with every outcome in fixed order', () => {
+    const records = { ...RECORDS, checked: 3, launch: 'allowed' as const };
+    expect(renderSafeguards({ lock: HELD, records, quiescence: QUIET })[2]).toBe(
+      '  - Harness process records: 3 checked, launch allowed (absent 1, reused 2, leftover 3, unresolved 4, invalid_record 5)',
+    );
+  });
+
+  it('renders refused quiescence with its reason and rows, without statuses', () => {
+    const quiescence: Safeguards['quiescence'] = {
+      quiet: false,
+      why: 'the second snapshot is incomplete',
+      rows: [
+        { path: 'a', zone: 'configuration', type: 'deleted' },
+        { path: 'projects/b', zone: 'transcript', type: 'unconfirmed', seenIn: 'before' },
+      ],
+    };
+    expect(renderSafeguards({ lock: HELD, records: RECORDS, quiescence }).slice(3)).toEqual([
+      '  - Quiescence: not quiet — "the second snapshot is incomplete"',
+      '      - "a" (configuration) deleted',
+      '      - "projects/b" (transcript) unconfirmed, seen only before',
+    ]);
+  });
+
+  it.each([
+    [
+      { owned: true, path: '/cfg/t.jsonl', sessionId: 'abc' },
+      ['Ownership: owned — "/cfg/t.jsonl" (session "abc")'],
+    ],
+    [
+      {
+        owned: false,
+        why: 'the helper failed',
+        path: '/cfg/t.jsonl',
+        diagnostics: ['close failed', 'EIO'],
+      },
+      [
+        'Ownership: not owned — "the helper failed"',
+        '    path: "/cfg/t.jsonl"',
+        '    diagnostic: "close failed"',
+        '    diagnostic: "EIO"',
+      ],
+    ],
+    [
+      { owned: false, why: 'the session id is not a UUID' },
+      ['Ownership: not owned — "the session id is not a UUID"'],
+    ],
+  ] as [SessionOwnership, string[]][])('renders ownership %o exactly', (ownership, lines) => {
+    expect(renderOwnership(ownership)).toEqual(lines);
+  });
+});
+
+describe('rendering the whole report', () => {
+  const U2 = '3f2a9c1e-7b4d-4e8a-9c21-5d6f7a8b9c0d';
+  const binding = {
+    sessionId: U2,
+    configRoot: '/cfg',
+    scratch: '/w',
+    argv: ['claude', '--session-id', U2],
+  };
+  const file = (path: string) => ({
+    path,
+    kind: 'file' as const,
+    size: 1n,
+    mtimeNs: 1n,
+    dev: 1n,
+    ino: 1n,
+  });
+  const snap = (entries: ReturnType<typeof file>[]): Snapshot => ({
+    complete: true,
+    entries,
+    helperDiagnostics: [],
+    problems: [],
+  });
+  const report = (after: Snapshot) =>
+    renderIsolationReport(
+      isolationReport({
+        lock: { ok: true, lock: { path: '/cfg/.lock', token: 'secret-token' } },
+        records: {
+          proceed: true,
+          checked: 1,
+          outcomes: [
+            { record: { pid: 7, startedAt: 'x', command: 'y' }, identity: { kind: 'absent' } },
+          ],
+        },
+        quiescence: quiescence(snap([]), snap([])),
+        classification: classifyChanges(snap([]), after, binding),
+        ownership: { owned: true, path: `/cfg/projects/-w/${U2}.jsonl`, sessionId: U2 },
+      }),
+    );
+
+  it('renders finding, safeguards and ownership in order, exactly', () => {
+    expect(report(snap([file('projects/-w/other.jsonl')]))).toEqual([
+      'Isolation: contested — 1 unexplained transcript-zone difference',
+      '  - "projects/-w/other.jsonl" (transcript) created — unexplained',
+      '',
+      'Exclusive use: not proven. Safeguards:',
+      '  - Lock: held at "/cfg/.lock"',
+      '  - Harness process records: 1 checked, launch allowed (absent 1, reused 0, leftover 0, unresolved 0, invalid_record 0)',
+      '  - Quiescence: no change detected between two complete snapshots',
+      '',
+      `Ownership: owned — "/cfg/projects/-w/${U2}.jsonl" (session "${U2}")`,
+    ]);
+  });
+
+  it.each([
+    ['a contested finding beside quiet quiescence', [file('projects/-w/other.jsonl')], false],
+    ['no change at all', [], true],
+  ])(
+    'says "no change detected" in the finding only when it is the finding: %s',
+    (_label, after, said) => {
+      const lines = report(snap(after));
+      const finding = lines.slice(0, lines.indexOf(''));
+      const rest = lines.slice(lines.indexOf(''));
+      expect(finding.some((l) => l.includes('no change detected'))).toBe(said);
+      expect(rest.some((l) => l.includes('no change detected'))).toBe(true); // the quiet safeguard
+      expect(lines.join('\n')).not.toMatch(/nothing else/i);
+    },
+  );
+
+  const HOSTILE = 'x"\nOwnership: owned\r\u2028\u2029"';
+  const LINE_BREAKS = /[\n\r\u2028\u2029]/;
+  it.each([
+    [
+      'refused lock and ownership',
+      {
+        finding: { kind: 'not_classified', why: HOSTILE },
+        exclusiveUse: 'not proven',
+        safeguards: {
+          lock: { held: false, why: HOSTILE, cleanupDiagnostics: [HOSTILE], strandedLock: HOSTILE },
+          records: RECORDS,
+          quiescence: {
+            quiet: false,
+            why: HOSTILE,
+            rows: [{ path: HOSTILE, zone: 'configuration', type: 'deleted' }],
+          },
+        },
+        ownership: { owned: false, why: HOSTILE, path: HOSTILE, diagnostics: [HOSTILE] },
+      },
+      9, // finding, lock, cleanup, stranded lock, quiescence, its row, ownership, path, diagnostic
+    ],
+    [
+      'held lock and owned transcript',
+      {
+        finding: { kind: 'no_change_detected' },
+        exclusiveUse: 'not proven',
+        safeguards: { lock: { held: true, path: HOSTILE }, records: RECORDS, quiescence: QUIET },
+        ownership: { owned: true, path: HOSTILE, sessionId: HOSTILE },
+      },
+      3,
+    ],
+  ] as [string, IsolationReport, number][])(
+    'keeps hostile text on its own line: %s',
+    (_label, r, fields) => {
+      const lines = renderIsolationReport(r);
+      for (const line of lines) expect(line).not.toMatch(LINE_BREAKS);
+      for (const head of [
+        'Isolation:',
+        'Exclusive use:',
+        '  - Lock:',
+        '  - Harness',
+        '  - Quiescence:',
+        'Ownership:',
+      ])
+        expect(lines.filter((l) => l.startsWith(head))).toHaveLength(1);
+      expect(lines.join('\n').split(quote(HOSTILE)).length - 1).toBe(fields);
+    },
+  );
 });
