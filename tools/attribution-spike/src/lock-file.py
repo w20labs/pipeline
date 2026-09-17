@@ -180,7 +180,11 @@ def acquire(directory, record, held, diagnostics):
         held.pop()  # closed here, so cleanup below does not close it twice
     except OSError as error:
         held.pop()
-        failure = failure or refused("close_failed", error)
+        # an earlier failure keeps the reason; the close still has to be visible, never dropped
+        if failure is None:
+            failure = refused("close_failed", error)
+        else:
+            diagnostics.append({"step": "close_temp", "errno": name_of(error)})
     if failure is not None:
         drop_temp()
         return failure

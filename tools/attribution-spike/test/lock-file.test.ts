@@ -1,5 +1,13 @@
 import { type ChildProcess, spawn as nodeSpawn, type spawn } from 'node:child_process';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +100,24 @@ const acquire = async (
   for (const text of [stdout, stderr]) expect(text).not.toContain(TOKEN); // never token-bearing
   return { result: JSON.parse(stdout) as Record<string, unknown>, stderr };
 };
+/** Runs the helper with argv exactly as given, so argument handling can be checked. */
+const acquireWith = async (args: string[]) => {
+  const pending = runChild('python3', [HELPER, ...args], {
+    deadline: Date.now() + 5_000,
+    termGraceMs: 200,
+    killGraceMs: 200,
+    spawn: trackingSpawn,
+    now: Date.now,
+    maxOutputBytes: 64_000,
+    input: JSON.stringify(RECORD),
+  });
+  running.push(pending);
+  const outcome = await pending;
+  expect(outcome).toMatchObject({ kind: 'closed', exitCode: 0 });
+  const { stdout } = (outcome as { evidence: { stdout: string } }).evidence;
+  return { result: JSON.parse(stdout) as Record<string, unknown> };
+};
+type Control = ReturnType<typeof control>;
 const refused = (reason: string, errno: string | null = null, diagnostics: unknown[] = []) => ({
   kind: 'refused',
   reason,
@@ -246,5 +272,349 @@ describe('taking the run lock', () => {
     const c = control();
     expect((await acquire(c.dir, '')).result).toEqual(refused('arguments'));
     expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+  });
+
+  /** Logs each open attempt and each close, so a path that should touch nothing can be checked. */
+  const LOG = [
+    'import json',
+    'real_open, real_close = os.open, os.close',
+    'def logged_open(path, flags, *a, **k):',
+    '    sys.stderr.write(json.dumps({"open": str(path)}) + "\\n")',
+    '    fd = real_open(path, flags, *a, **k)  # logged first, so a refused open is still seen',
+    '    sys.stderr.write(json.dumps({"opened": fd}) + "\\n")',
+    '    return fd',
+    'def logged_close(fd):',
+    '    sys.stderr.write(json.dumps({"close": fd}) + "\\n")',
+    '    real_close(fd)',
+    'os.open, os.close = logged_open, logged_close',
+    'if real_open in os.supports_dir_fd: os.supports_dir_fd.add(logged_open)',
+  ].join('\n');
+  const logged = (stderr: string) =>
+    stderr.split('\n').flatMap((l) => (l === '' ? [] : [JSON.parse(l) as Record<string, unknown>]));
+
+  it.each([
+    ['open without dir_fd', 'os.supports_dir_fd.discard(os.open)'],
+    ['link without dir_fd', 'os.supports_dir_fd.discard(os.link)'],
+    ['unlink without dir_fd', 'os.supports_dir_fd.discard(os.unlink)'],
+    ['stat without dir_fd', 'os.supports_dir_fd.discard(os.stat)'],
+    ['stat without follow_symlinks', 'os.supports_follow_symlinks.discard(os.stat)'],
+    ['link without follow_symlinks', 'os.supports_follow_symlinks.discard(os.link)'],
+    ['no fstat', 'del os.fstat'],
+    ['no fsync', 'del os.fsync'],
+    ['no O_NOFOLLOW', 'del os.O_NOFOLLOW'],
+    ['no O_DIRECTORY', 'del os.O_DIRECTORY'],
+    ['no O_NONBLOCK', 'del os.O_NONBLOCK'],
+    ['no O_CLOEXEC', 'del os.O_CLOEXEC'],
+  ])('refuses a Python with %s, opening nothing', async (_label, patch) => {
+    const c = control();
+    const shim = shimmed(c.base, `python3-cap-${patch.replace(/\W/g, '')}`, `${patch}\n${LOG}`);
+    const { result, stderr } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+    expect(result).toEqual(refused('capability'));
+    expect(logged(stderr)).toEqual([]);
+    expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+  });
+
+  it.each([
+    ['a missing flag', ['--dir']],
+    ['an unknown flag', ['--dir', '/tmp', '--why', 'x']],
+    ['another mode', ['--dir', '/tmp', '--mode', 'release']],
+    ['a relative directory', ['--dir', 'control', '--mode', 'acquire']],
+    ['a trailing slash', ['--dir', '/tmp/control/', '--mode', 'acquire']],
+    ['a .. segment', ['--dir', '/tmp/control/..', '--mode', 'acquire']],
+    ['a path through .. that exists', ['--dir', 'THROUGH-DOTDOT', '--mode', 'acquire']],
+    ['a leading //', ['--dir', '//tmp/control', '--mode', 'acquire']],
+  ])('refuses %s, creating nothing', async (_label, args) => {
+    const c = control();
+    const { result } = await acquireWith(
+      args.map((a) =>
+        a === '/tmp'
+          ? c.dir
+          : a === 'THROUGH-DOTDOT'
+            ? `${c.base}/../${join(c.base, 'control').slice(1)}`
+            : a,
+      ),
+    );
+    expect(result).toEqual(refused('arguments'));
+    expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+  });
+
+  it.each([
+    [
+      'a missing control directory',
+      (c: Control) => join(c.base, 'absent'),
+      'directory_missing',
+      'ENOENT',
+    ],
+    [
+      'a control directory that is a file',
+      (c: Control) => (writeFileSync(join(c.base, 'plain'), ''), join(c.base, 'plain')),
+      'directory_unusable',
+      'ENOTDIR',
+    ],
+    [
+      'a control directory that is a symlink',
+      (c: Control) => (symlinkSync(c.dir, join(c.base, 'link')), join(c.base, 'link')),
+      'directory_unusable',
+      'ENOTDIR',
+    ],
+  ])('refuses %s', async (_label, locate, reason, errno) => {
+    const c = control();
+    const dir = locate(c);
+    const { result } = await acquire(dir, JSON.stringify(RECORD));
+    expect(result).toEqual(refused(reason, errno));
+    expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+  });
+
+  /** Records the temporary file's descriptor: the only one opened relative to the directory. */
+  const TRACK_TEMP = [
+    'temps = []',
+    'real_open = os.open',
+    'def tracking_open(path, flags, *a, **k):',
+    '    fd = real_open(path, flags, *a, **k)',
+    '    if k.get("dir_fd") is not None: temps.append(fd)',
+    '    return fd',
+    'os.open = tracking_open',
+    'os.supports_dir_fd.add(tracking_open)',
+  ].join('\n');
+
+  /**
+   * Makes one os function fail. A wrapper keeps the capabilities it wraps, or the helper would
+   * refuse for want of a capability instead.
+   */
+  const failing = (target: string, code: string, when = 'True') =>
+    [
+      `real_${target} = os.${target}`,
+      `def failing_${target}(*a, **k):`,
+      `    if ${when}: raise OSError(errno.${code}, os.strerror(errno.${code}))`,
+      `    return real_${target}(*a, **k)`,
+      `os.${target} = failing_${target}`,
+      `if real_${target} in os.supports_dir_fd: os.supports_dir_fd.add(failing_${target})`,
+      `if real_${target} in os.supports_follow_symlinks: os.supports_follow_symlinks.add(failing_${target})`,
+    ].join('\n');
+
+  /** Closes for real exactly once, then reports failure — for the temporary file's descriptor only. */
+  const FAILING_CLOSE = [
+    'real_close = os.close',
+    'def failing_close(fd):',
+    '    real_close(fd)',
+    '    if fd in temps: raise OSError(errno.EBADF, os.strerror(errno.EBADF))',
+    'os.close = failing_close',
+  ].join('\n');
+
+  /** Only the temporary file's own close fails; the directory's must still succeed. */
+  const CLOSE_TEMP_FAILS = `${TRACK_TEMP}\n${FAILING_CLOSE}`;
+
+  it.each([
+    ['a failed fsync', failing('fsync', 'EIO'), refused('fsync_failed', 'EIO')],
+    ['a failed close of the temporary file', CLOSE_TEMP_FAILS, refused('close_failed', 'EBADF')],
+    ['a failed link', failing('link', 'EXDEV'), refused('link_failed', 'EXDEV')],
+    [
+      'a write of no bytes',
+      'real_write = os.write\nos.write = lambda fd, data: 0 if fd > 2 else real_write(fd, data)',
+      refused('write_failed'),
+    ],
+  ])(
+    'refuses %s before publishing, removing only its own temporary file',
+    async (_label, patch, expected) => {
+      const c = control();
+      const shim = shimmed(c.base, `python3-${String(made.length)}-fail`, patch);
+      expect((await acquire(c.dir, JSON.stringify(RECORD), shim)).result).toEqual(expected);
+      expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+    },
+  );
+
+  it.each([
+    ['a failed write', failing('write', 'EIO', 'a[0] > 2'), 'write_failed', 'EIO'],
+    ['a failed fsync', failing('fsync', 'EIO'), 'fsync_failed', 'EIO'],
+  ])(
+    'keeps %s as the reason when the close then fails too',
+    async (_label, patch, reason, errno) => {
+      const c = control();
+      const shim = shimmed(
+        c.base,
+        `python3-${String(made.length)}-both`,
+        `${patch}\n${CLOSE_TEMP_FAILS}`,
+      );
+      const { result } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+      // neither failure disappears: the first is the reason, the close is a diagnostic beside it
+      expect(result).toEqual(refused(reason, errno, [{ step: 'close_temp', errno: 'EBADF' }]));
+      expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+    },
+  );
+
+  it('cannot prove ownership when fstat fails, so it publishes nothing and removes nothing', async () => {
+    const c = control();
+    const shim = shimmed(c.base, 'python3-fstat-fails', failing('fstat', 'EIO'));
+    const { result } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+    expect(result).toEqual(
+      refused('ownership_unknown', 'EIO', [{ step: 'temp_may_remain', errno: null }]),
+    );
+    expect(entries(c.dir).lock).toBeUndefined();
+    expect(entries(c.dir).temp).toBe(''); // left exactly as created: empty, and not ours to remove
+  });
+
+  const lockOf = (dir: string) =>
+    JSON.parse(readFileSync(join(dir, 'run.lock'), 'utf8')) as Record<string, unknown>;
+  const RECORDED = {
+    version: 1,
+    runId: 'run-1',
+    pid: 4_242,
+    startedAt: '2026-09-17T08:30:00Z',
+    token: TOKEN,
+  };
+
+  it.each([
+    [
+      'the temporary file cannot be removed',
+      `${TRACK_TEMP}\n${failing('unlink', 'EIO')}`,
+      [{ step: 'unlink_temp', errno: 'EIO' }],
+      true,
+    ],
+    [
+      'the directory will not close',
+      `${TRACK_TEMP}\nreal_close = os.close\ndef failing_close(fd):\n    real_close(fd)\n    if fd not in temps: raise OSError(errno.EBADF, "bad")\nos.close = failing_close`,
+      [{ step: 'close_directory', errno: 'EBADF' }],
+      false,
+    ],
+  ])(
+    'still holds the lock when %s after publishing',
+    async (_label, patch, diagnostics, tempLeft) => {
+      const c = control();
+      const shim = shimmed(c.base, `python3-${String(made.length)}-after`, patch);
+      const { result } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+      // publication happened: the run holds the lock, and the diagnostic stays beside it
+      expect(result).toEqual({ kind: 'acquired', diagnostics });
+      expect(lockOf(c.dir)).toEqual(RECORDED);
+      expect(entries(c.dir).temp !== undefined).toBe(tempLeft);
+    },
+  );
+
+  it('reports a temporary file it can no longer stat, still holding the lock', async () => {
+    const c = control();
+    const patch = [
+      'real_stat = os.stat',
+      'def failing(*a, **k):',
+      '    if k.get("dir_fd") is not None: raise OSError(errno.EIO, "io")',
+      '    return real_stat(*a, **k)',
+      'os.stat = failing',
+      'os.supports_dir_fd.add(failing)',
+      'os.supports_follow_symlinks.add(failing)',
+    ].join('\n');
+    const shim = shimmed(c.base, 'python3-stat-fails-late', patch);
+    const { result } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+    expect(result).toEqual({
+      kind: 'acquired',
+      diagnostics: [{ step: 'unlink_temp', errno: 'EIO' }],
+    });
+    expect(lockOf(c.dir)).toEqual(RECORDED);
+    // the written record, left in place: never removed without evidence that it is still ours
+    expect(JSON.parse(entries(c.dir).temp ?? '')).toEqual(RECORDED);
+  });
+
+  it('will not remove a temporary name that is no longer the file it created', async () => {
+    const c = control();
+    const other = join(c.base, 'someone-else');
+    writeFileSync(other, 'not ours');
+    // replacing our temporary file breaks the cooperative assumption; the helper still refuses to
+    // remove a name whose device and inode no longer match what it created
+    const patch = [
+      'import shutil',
+      'real_link = os.link',
+      'def swapping(*a, **k):',
+      '    result = real_link(*a, **k)',
+      `    os.replace(${JSON.stringify(other)}, os.path.join(${JSON.stringify(c.dir)}, a[0]))`,
+      '    return result',
+      'os.link = swapping',
+      'os.supports_dir_fd.add(swapping)',
+      'os.supports_follow_symlinks.add(swapping)',
+    ].join('\n');
+    const shim = shimmed(c.base, 'python3-swap-temp', patch);
+    const { result } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+    expect(result).toEqual({
+      kind: 'acquired',
+      diagnostics: [{ step: 'temp_replaced', errno: null }],
+    });
+    expect(lockOf(c.dir)).toEqual(RECORDED);
+    expect(entries(c.dir).temp).toBe('not ours'); // left alone, exactly as the intruder put it
+  });
+
+  it('links the temporary name without following it', async () => {
+    const c = control();
+    const target = join(c.base, 'target');
+    writeFileSync(target, 'target contents');
+    const calls = join(c.base, 'link-calls');
+    // the temporary file is replaced by a symlink before publication: outside the cooperative
+    // assumptions, and no proof that a valid record was published — only that the target is untouched
+    const patch = [
+      'import json',
+      'real_link = os.link',
+      'def logged(*a, **k):',
+      `    open(${JSON.stringify(calls)}, "w").write(json.dumps({"follow": k.get("follow_symlinks"), "src": k.get("src_dir_fd") is not None, "dst": k.get("dst_dir_fd") is not None}))`,
+      '    return real_link(*a, **k)',
+      'os.link = logged',
+      'os.supports_dir_fd.add(logged)',
+      'os.supports_follow_symlinks.add(logged)',
+      'real_fsync = os.fsync',
+      'def swapping_fsync(fd):',
+      '    result = real_fsync(fd)',
+      `    path = os.path.join(${JSON.stringify(c.dir)}, "run.lock.tmp-${NONCE}")`,
+      '    os.unlink(path)',
+      `    os.symlink(${JSON.stringify(target)}, path)`,
+      '    return result',
+      'os.fsync = swapping_fsync',
+    ].join('\n');
+    const shim = shimmed(c.base, 'python3-link-nofollow', patch);
+    const { result } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+    expect(JSON.parse(readFileSync(calls, 'utf8'))).toEqual({
+      follow: false,
+      src: true,
+      dst: true,
+    });
+    expect(result).toMatchObject({ kind: 'acquired' });
+    expect(readFileSync(target, 'utf8')).toBe('target contents'); // never written through
+  });
+
+  it('reports a symlinked lock as held, touching neither it nor its target', async () => {
+    const c = control();
+    const target = join(c.base, 'target');
+    writeFileSync(target, 'target contents');
+    symlinkSync(target, join(c.dir, 'run.lock'));
+    const { result } = await acquire(c.dir);
+    expect(result).toEqual({ kind: 'held', diagnostics: [] });
+    expect(lstatSync(join(c.dir, 'run.lock')).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, 'utf8')).toBe('target contents');
+    expect(entries(c.dir).temp).toBeUndefined();
+  });
+
+  it.each([
+    ['an acquisition', () => undefined],
+    ['a held lock', (c: Control) => writeFileSync(join(c.dir, 'run.lock'), 'other')],
+    ['a refused temporary name', (c: Control) => writeFileSync(join(c.dir, TEMP), 'other')],
+  ])(
+    'closes every descriptor it opened, and writes one line, after %s',
+    async (_label, arrange) => {
+      const c = control();
+      arrange(c);
+      const shim = shimmed(c.base, `python3-${String(made.length)}-log`, LOG);
+      const { stderr } = await acquire(c.dir, JSON.stringify(RECORD), shim);
+      const events = logged(stderr);
+      const opened = events.filter((e) => 'opened' in e).map((e) => e['opened']);
+      // a refused open yields no descriptor; each one returned is closed exactly once
+      expect(opened.length).toBeGreaterThan(0);
+      expect(events.filter((e) => 'close' in e).map((e) => e['close'])).toEqual(
+        [...opened].reverse(),
+      );
+    },
+  );
+
+  it('writes the exact record through one-byte writes', async () => {
+    const c = control();
+    const patch = 'real_write = os.write\nos.write = lambda fd, data: real_write(fd, data[:1])';
+    const shim = shimmed(c.base, 'python3-short-writes', patch);
+    expect((await acquire(c.dir, JSON.stringify(RECORD), shim)).result).toEqual({
+      kind: 'acquired',
+      diagnostics: [],
+    });
+    expect(lockOf(c.dir)).toEqual(RECORDED);
   });
 });
