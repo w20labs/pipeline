@@ -1,4 +1,4 @@
-"""Take the research run lock, published atomically, from a directory descriptor.
+"""Take or release the research run lock, from a directory descriptor.
 
 Run as a subprocess so the caller can stop it. The record is written to a temporary file named by a
 nonce, then published with link(), which is atomic: run.lock either does not exist or holds a whole
@@ -16,14 +16,22 @@ NOT CRASH DURABILITY: the record is whole before it is published, but the direct
 
 INPUT: one JSON object on stdin, at most 4096 bytes, UTF-8, with exactly runId, pid, startedAt,
   token and nonce. The record written is {version, runId, pid, startedAt, token}; the nonce only
-  names the temporary file.
+  names the temporary file. Release reads the same record: its token is what proves ownership.
 
 OUTPUT: exactly one JSON line on stdout, exit status 0, after every descriptor is closed.
   {"kind": "acquired", "diagnostics": [DIAGNOSTIC, ...]}   run.lock was published by this run
   {"kind": "held", "diagnostics": [...]}                   something already held run.lock
   {"kind": "refused", "reason": REASON, "errno": str|null, "diagnostics": [...]}
-REASON: arguments, capability, directory_missing, directory_unusable, temp_exists, temp_create_failed,
-  ownership_unknown, write_failed, fsync_failed, close_failed, link_failed.
+REASON (acquire): arguments, capability, directory_missing, directory_unusable, temp_exists,
+  temp_create_failed, ownership_unknown, write_failed, fsync_failed, close_failed, link_failed.
+
+RELEASE (--mode release) removes run.lock only while it still holds a whole record carrying this
+run's token, rechecked by device and inode immediately before the unlink.
+  {"kind": "released"|"missing"|"not_ours"|"unrecognized"|"replaced", "diagnostics": [...]}
+  {"kind": "refused", "reason": REASON, "errno": str|null, "diagnostics": [...]}
+REASON (release): arguments, capability, directory_missing, directory_unusable, lock_unusable,
+  not_regular, fstat_failed, read_failed, too_large, stat_failed, unlink_failed.
+Anything but "released" leaves the file exactly as found: same bytes, inode and type.
 DIAGNOSTIC: {"step": str, "errno": str|null}, step one of close_temp, unlink_temp, temp_replaced,
   temp_may_remain, close_directory. `acquired` with diagnostics still means the lock is held: the
   caller must release it, and must keep the diagnostics.
@@ -33,6 +41,7 @@ import errno as errnos
 import json
 import os
 import re
+import stat
 import sys
 from datetime import datetime
 
@@ -41,6 +50,7 @@ HEX32 = re.compile(r"[0-9a-f]{32}")
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z")
 FIELDS = ("runId", "pid", "startedAt", "token", "nonce")
+WRITTEN = ("version", "runId", "pid", "startedAt", "token")
 FLAGS = ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_CLOEXEC")
 
 
@@ -87,8 +97,8 @@ def read_record():
         return None
     try:
         record = json.loads(data.decode("utf-8"), object_pairs_hook=no_duplicates)
-    except (UnicodeDecodeError, ValueError):
-        return None
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None  # deeply nested JSON exhausts the parser: refuse, never crash
     if not isinstance(record, dict) or tuple(sorted(record)) != tuple(sorted(FIELDS)):
         return None
     if not (isinstance(record["pid"], int) and not isinstance(record["pid"], bool) and record["pid"] > 0):
@@ -103,7 +113,7 @@ def read_record():
 
 
 def parse(argv):
-    if len(argv) != 4 or argv[0::2] != ["--dir", "--mode"] or argv[3] != "acquire":
+    if len(argv) != 4 or argv[0::2] != ["--dir", "--mode"] or argv[3] not in ("acquire", "release"):
         return None
     directory = argv[1]
     if (
@@ -114,7 +124,97 @@ def parse(argv):
         or os.path.basename(directory) in ("", ".", "..")
     ):
         return None
-    return directory
+    return directory, argv[3]
+
+
+def whole_integer(value):
+    """A real integer, never a bool: Python counts True as 1, which must not pass for a version."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def lock_record(data):
+    """The record a lock file must hold, or None. Same rules as the record this helper writes."""
+    try:
+        record = json.loads(data.decode("utf-8"), object_pairs_hook=no_duplicates)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None  # deeply nested JSON exhausts the parser: refuse, never crash
+    if not isinstance(record, dict) or tuple(sorted(record)) != tuple(sorted(WRITTEN)):
+        return None
+    if not (whole_integer(record["version"]) and record["version"] == 1):
+        return None
+    if not (whole_integer(record["pid"]) and record["pid"] > 0):
+        return None
+    if not all(isinstance(record[f], str) for f in ("runId", "token")):
+        return None
+    if not RUN_ID.fullmatch(record["runId"]) or not real_stamp(record["startedAt"]):
+        return None
+    return record if HEX32.fullmatch(record["token"]) else None
+
+
+def read_whole(fd, cap):
+    """At most cap + 1 bytes, through short reads. More than cap means the file is too large."""
+    data = bytearray()
+    while len(data) <= cap:
+        try:
+            chunk = os.read(fd, cap + 1 - len(data))
+        except OSError as error:
+            return None, refused("read_failed", error)
+        if not chunk:
+            break
+        data += chunk
+    return (None, refused("too_large")) if len(data) > cap else (bytes(data), None)
+
+
+def release(directory, record, held, diagnostics):
+    """Remove run.lock, but only while it is still the whole record this run's token published.
+
+    RACE: between the device and inode recheck and the unlink, the name could still be replaced, so
+    the unlink could remove a different file. POSIX offers no unlink-by-descriptor to close that
+    window. Under the cooperative assumptions it cannot arise; outside them the recheck narrows it.
+    """
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    lock_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        held.append(("close_directory", os.open(directory, dir_flags)))
+    except OSError as error:
+        kind = "directory_missing" if error.errno == errnos.ENOENT else "directory_unusable"
+        return refused(kind, error)
+    dir_fd = held[0][1]
+    try:
+        fd = os.open("run.lock", lock_flags, dir_fd=dir_fd)
+    except OSError as error:
+        if error.errno == errnos.ENOENT:
+            return {"kind": "missing"}
+        return refused("lock_unusable", error)
+    held.append(("close_lock", fd))
+
+    try:
+        owned = os.fstat(fd)
+    except OSError as error:
+        return refused("fstat_failed", error)
+    if not stat.S_ISREG(owned.st_mode):
+        return refused("not_regular")
+    data, failure = read_whole(fd, MAX_INPUT)
+    if failure is not None:
+        return failure
+    held_record = lock_record(data)
+    if held_record is None:
+        return {"kind": "unrecognized"}
+    if held_record["token"] != record["token"]:
+        return {"kind": "not_ours"}
+
+    # the same file, right now: a name that has been replaced is never unlinked
+    try:
+        now = os.stat("run.lock", dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as error:
+        return refused("stat_failed", error)
+    if (now.st_dev, now.st_ino) != (owned.st_dev, owned.st_ino):
+        return {"kind": "replaced"}
+    try:
+        os.unlink("run.lock", dir_fd=dir_fd)
+    except OSError as error:
+        return refused("unlink_failed", error)
+    return {"kind": "released"}
 
 
 def write_all(fd, data):
@@ -166,9 +266,7 @@ def acquire(directory, record, held, diagnostics):
         except OSError as error:
             diagnostics.append({"step": "unlink_temp", "errno": name_of(error)})
 
-    body = json.dumps(
-        {"version": 1, **{f: record[f] for f in ("runId", "pid", "startedAt", "token")}}
-    ).encode("utf-8") + b"\n"
+    body = json.dumps({"version": 1, **{f: record[f] for f in WRITTEN[1:]}}).encode("utf-8") + b"\n"
     failure = write_all(fd, body)
     if failure is None:
         try:
@@ -200,16 +298,18 @@ def acquire(directory, record, held, diagnostics):
 
 
 def main(argv):
-    directory = parse(argv)
-    record = read_record() if directory is not None else None
+    parsed = parse(argv)
+    record = read_record() if parsed is not None else None
     held, diagnostics = [], []
-    if directory is None or record is None:
+    if parsed is None or record is None:
         result = refused("arguments")
     elif not capable():
         result = refused("capability")
     else:
+        directory, mode = parsed
         try:
-            result = acquire(directory, record, held, diagnostics)
+            run = acquire if mode == "acquire" else release
+            result = run(directory, record, held, diagnostics)
         finally:
             for step, fd in reversed(held):
                 try:

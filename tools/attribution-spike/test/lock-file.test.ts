@@ -81,8 +81,9 @@ const acquire = async (
   dir: string,
   input: string | Uint8Array = JSON.stringify(RECORD),
   python?: string,
+  mode: 'acquire' | 'release' = 'acquire',
 ) => {
-  const argv = [HELPER, '--dir', dir, '--mode', 'acquire'];
+  const argv = [HELPER, '--dir', dir, '--mode', mode];
   const pending = runChild(python ?? 'python3', argv, {
     deadline: Date.now() + 5_000,
     termGraceMs: 200,
@@ -223,6 +224,7 @@ describe('taking the run lock', () => {
       Buffer.concat([Buffer.from('{"runId":"'), Buffer.from([0xff]), Buffer.from('"}')]),
     ],
     ['text that is not JSON', SENTINEL],
+    ['deeply nested JSON', `${'['.repeat(1_100)}${']'.repeat(1_100)}`],
     ['an array', JSON.stringify([RECORD])],
     ['a number', '7'],
     // both values are valid: only duplicate detection can refuse this one
@@ -317,7 +319,7 @@ describe('taking the run lock', () => {
   it.each([
     ['a missing flag', ['--dir']],
     ['an unknown flag', ['--dir', '/tmp', '--why', 'x']],
-    ['another mode', ['--dir', '/tmp', '--mode', 'release']],
+    ['an unknown mode', ['--dir', '/tmp', '--mode', 'renew']],
     ['a relative directory', ['--dir', 'control', '--mode', 'acquire']],
     ['a trailing slash', ['--dir', '/tmp/control/', '--mode', 'acquire']],
     ['a .. segment', ['--dir', '/tmp/control/..', '--mode', 'acquire']],
@@ -616,5 +618,136 @@ describe('taking the run lock', () => {
       diagnostics: [],
     });
     expect(lockOf(c.dir)).toEqual(RECORDED);
+  });
+
+  describe('releasing it again', () => {
+    const OTHER = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const release = (
+      dir: string,
+      input: string | Uint8Array = JSON.stringify(RECORD),
+      python?: string,
+    ) => acquire(dir, input, python, 'release');
+    /** Bytes, inode and type: reading a file updates its access time, which proves nothing here. */
+    const asFound = (path: string) => {
+      const info = lstatSync(path);
+      return { bytes: readFileSync(path, 'utf8'), ino: info.ino, type: info.mode & 0o170000 };
+    };
+    const locked = async (c: Control) => {
+      expect((await acquire(c.dir)).result).toMatchObject({ kind: 'acquired' });
+      return asFound(join(c.dir, 'run.lock'));
+    };
+
+    it('removes the lock its own token published', async () => {
+      const c = control();
+      await locked(c);
+      const { result, stderr } = await release(c.dir);
+      expect(result).toEqual({ kind: 'released', diagnostics: [] });
+      expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+      expect(stderr).toBe('');
+    });
+
+    it('reports a lock that is not there', async () => {
+      const c = control();
+      expect((await release(c.dir)).result).toEqual({ kind: 'missing', diagnostics: [] });
+      expect(entries(c.dir)).toEqual({ lock: undefined, temp: undefined });
+    });
+
+    it('leaves another run’s lock exactly as found', async () => {
+      const c = control();
+      const before = await locked(c);
+      const other = JSON.stringify({ ...RECORD, runId: 'run-2', token: OTHER, nonce: OTHER });
+      expect((await release(c.dir, other)).result).toEqual({ kind: 'not_ours', diagnostics: [] });
+      expect(asFound(join(c.dir, 'run.lock'))).toEqual(before);
+    });
+
+    it('will not release a lock whose token merely starts like its own', async () => {
+      const c = control();
+      const before = await locked(c);
+      // the same first half, a different second: only a whole-token comparison can tell them apart
+      const near = `${TOKEN.slice(0, 16)}${'9'.repeat(16)}`;
+      const other = JSON.stringify({ ...RECORD, token: near, nonce: OTHER });
+      expect((await release(c.dir, other)).result).toEqual({ kind: 'not_ours', diagnostics: [] });
+      expect(asFound(join(c.dir, 'run.lock'))).toEqual(before);
+    });
+
+    const held = (over: object) => JSON.stringify({ ...RECORDED, ...over });
+    it.each([
+      ['text that is not JSON', 'not json'],
+      ['an array', JSON.stringify([RECORDED])],
+      ['a duplicate key', `{${held({}).slice(1, -1)}, "token": "${TOKEN}"}`],
+      ['a missing key', JSON.stringify({ ...RECORDED, token: undefined })],
+      ['an unknown key', held({ extra: 1 })],
+      ['version 2', held({ version: 2 })],
+      ['version true', held({ version: true })],
+      ['a boolean pid', held({ pid: true })],
+      ['a pid of zero', held({ pid: 0 })],
+      ['a malformed token', held({ token: TOKEN.toUpperCase() })],
+      ['a runId with a separator', held({ runId: 'a/b' })],
+      ['an impossible timestamp', held({ startedAt: '2026-02-30T00:00:00Z' })],
+    ])('leaves a lock holding %s exactly as found', async (_label, body) => {
+      const c = control();
+      writeFileSync(join(c.dir, 'run.lock'), body);
+      const before = asFound(join(c.dir, 'run.lock'));
+      expect((await release(c.dir)).result).toEqual({ kind: 'unrecognized', diagnostics: [] });
+      expect(asFound(join(c.dir, 'run.lock'))).toEqual(before);
+    });
+
+    /**
+     * Recursion depends on the interpreter: /usr/bin/python3 3.9.6 exhausts its parser at 1,100
+     * levels while 3.14 parses them, so the shim makes the parser recurse on any version.
+     */
+    const RECURSING = [
+      'import json',
+      'real_loads = json.loads',
+      'def recursing(text, **k):',
+      '    raise RecursionError("maximum recursion depth exceeded")',
+      'json.loads = recursing',
+    ].join('\n');
+
+    it('reports a lock whose parser exhausts itself, leaving it as found', async () => {
+      const c = control();
+      writeFileSync(join(c.dir, 'run.lock'), JSON.stringify(RECORDED));
+      const before = asFound(join(c.dir, 'run.lock'));
+      const shim = shimmed(c.base, 'python3-recursing-lock', RECURSING);
+      // the stdin record is parsed first, so this shim refuses there: it proves the catch, not the kind
+      expect((await release(c.dir, JSON.stringify(RECORD), shim)).result).toEqual(
+        refused('arguments'),
+      );
+      expect(asFound(join(c.dir, 'run.lock'))).toEqual(before);
+    });
+
+    it('reports a lock the parser cannot take, once past the record it was given', async () => {
+      const c = control();
+      writeFileSync(join(c.dir, 'run.lock'), JSON.stringify(RECORDED));
+      const before = asFound(join(c.dir, 'run.lock'));
+      // recursion only for the lock's own bytes: the record on stdin still parses
+      const patch = `${RECURSING.replace('def recursing(text, **k):', 'def recursing(text, **k):\n    if not text.startswith("{\\"version\\""): return real_loads(text, **k)')}`;
+      const shim = shimmed(c.base, 'python3-recursing-record', patch);
+      expect((await release(c.dir, JSON.stringify(RECORD), shim)).result).toEqual({
+        kind: 'unrecognized',
+        diagnostics: [],
+      });
+      expect(asFound(join(c.dir, 'run.lock'))).toEqual(before);
+    });
+
+    it('leaves a deeply nested lock exactly as found', async () => {
+      const c = control();
+      const nested = `${'['.repeat(1_100)}${']'.repeat(1_100)}`; // exhausts some parsers, not all
+      writeFileSync(join(c.dir, 'run.lock'), nested);
+      const before = asFound(join(c.dir, 'run.lock'));
+      expect((await release(c.dir)).result).toEqual({ kind: 'unrecognized', diagnostics: [] });
+      expect(asFound(join(c.dir, 'run.lock'))).toEqual(before);
+    });
+
+    it('leaves a lock of bytes that are not UTF-8 exactly as found', async () => {
+      const c = control();
+      writeFileSync(
+        join(c.dir, 'run.lock'),
+        Buffer.concat([Buffer.from('{"version":'), Buffer.from([0xff]), Buffer.from('}')]),
+      );
+      const before = lstatSync(join(c.dir, 'run.lock')).ino;
+      expect((await release(c.dir)).result).toEqual({ kind: 'unrecognized', diagnostics: [] });
+      expect(lstatSync(join(c.dir, 'run.lock')).ino).toBe(before);
+    });
   });
 });
