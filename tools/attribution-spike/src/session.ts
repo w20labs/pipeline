@@ -59,6 +59,30 @@ export const productionReader =
     return readFirstRecord(root, components, { ...safe, deadline });
   };
 
+export type ExpectedTranscript =
+  | { readonly ok: true; readonly components: readonly string[]; readonly path: string }
+  | { readonly ok: false; readonly why: string; readonly path?: string };
+
+/**
+ * Where a bound launch's transcript must be, relative to its configuration root — or why the binding
+ * is refused. Decided from the recorded launch alone; nothing is read.
+ */
+export const expectedTranscript = (binding: LaunchBinding): ExpectedTranscript => {
+  const { sessionId, configRoot, scratch, argv } = binding;
+  if (!UUID.test(sessionId)) return { ok: false, why: 'the session id is not a UUID' };
+  if (!isAbsolute(configRoot) || !isAbsolute(scratch))
+    return { ok: false, why: 'the configuration root and working directory must be absolute' };
+  const flag = argv.indexOf('--session-id');
+  if (flag === -1 || argv[flag + 1] !== sessionId || argv.lastIndexOf('--session-id') !== flag)
+    return { ok: false, why: 'the recorded launch was not bound to exactly this session id' };
+
+  const components = ['projects', claudeSlug(scratch), `${sessionId}.jsonl`];
+  const path = join(configRoot, ...components);
+  if (!components.every(validComponent))
+    return { ok: false, why: 'the expected path has an invalid component', path };
+  return { ok: true, components, path };
+};
+
 /**
  * Whether the transcript for a bound launch exists and identifies itself as that session.
  *
@@ -71,22 +95,15 @@ export const sessionBoundTranscript = async (
   preExisting: ReadonlySet<string>,
   read: RecordReader,
 ): Promise<SessionOwnership> => {
-  const { sessionId, configRoot, scratch, argv } = binding;
-
-  if (!UUID.test(sessionId)) return { owned: false, why: 'the session id is not a UUID' };
-  if (!isAbsolute(configRoot) || !isAbsolute(scratch))
+  const { sessionId, configRoot, scratch } = binding;
+  const expected = expectedTranscript(binding);
+  if (!expected.ok)
     return {
       owned: false,
-      why: 'the configuration root and working directory must be absolute',
+      why: expected.why,
+      ...(expected.path === undefined ? {} : { path: expected.path }),
     };
-  const flag = argv.indexOf('--session-id');
-  if (flag === -1 || argv[flag + 1] !== sessionId || argv.lastIndexOf('--session-id') !== flag)
-    return { owned: false, why: 'the recorded launch was not bound to exactly this session id' };
-
-  const components = ['projects', claudeSlug(scratch), `${sessionId}.jsonl`];
-  const path = join(configRoot, ...components);
-  if (!components.every(validComponent))
-    return { owned: false, why: 'the expected path has an invalid component', path };
+  const { components, path } = expected;
   if (preExisting.has(path))
     return { owned: false, why: 'the expected transcript existed before launch', path };
 
