@@ -65,4 +65,24 @@ describe('the built package', () => {
       problems: [],
     });
   }, 30_000);
+
+  it('finds and runs the control-file helper from an unrelated working directory', async () => {
+    const control = mkdtempSync(join(scratch, 'control-'));
+    writeFileSync(join(control, 'bootstrap.json'), 'built\n');
+    const script = `
+      const { readControlFile, CONTROL_HELPER } = await import(${JSON.stringify(pathToFileURL(join(built, 'control-file.js')).href)});
+      const r = await readControlFile(${JSON.stringify(control)}, 'bootstrap.json', { deadline: Date.now() + 10000, cap: 64 });
+      process.stdout.write(JSON.stringify({ helper: CONTROL_HELPER, kind: r.kind, text: r.kind === 'read' ? r.bytes.toString() : r }));
+    `;
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ['--input-type=module', '-e', script],
+      { cwd: mkdtempSync(join(scratch, 'cwd-')), timeout: 20_000, killSignal: 'SIGKILL' },
+    );
+    expect(JSON.parse(stdout)).toEqual({
+      helper: join(built, 'read-control-file.py'),
+      kind: 'read',
+      text: 'built\n',
+    });
+  }, 30_000);
 });
