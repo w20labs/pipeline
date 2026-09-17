@@ -1,12 +1,23 @@
 import { spawn } from 'node:child_process';
-import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { runChild } from '../src/child.js';
+import { runChild, type ChildOutcome } from '../src/child.js';
+import { takeSnapshot } from '../src/snapshot.js';
 
 /**
  * The snapshot helper on its own, run through `runChild` so every invocation is bounded and its
@@ -14,7 +25,14 @@ import { runChild } from '../src/child.js';
  */
 const HELPER = fileURLToPath(new URL('../src/snapshot-tree.py', import.meta.url));
 const made: string[] = [];
-afterEach(() => made.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
+const locked: string[] = [];
+const running: Promise<unknown>[] = [];
+afterEach(async () => {
+  // a failed assertion can leave a helper walking the tree: let it end (bounded) before deleting it
+  await Promise.allSettled(running.splice(0));
+  locked.splice(0).forEach((d) => chmodSync(d, 0o755));
+  made.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true }));
+}, 15_000);
 const tree = () => {
   const base = mkdtempSync(join(tmpdir(), 'pipeline-snapshot-'));
   made.push(base);
@@ -28,14 +46,16 @@ const tree = () => {
 type Line = Record<string, unknown>;
 /** Run the helper, bounded, and return its parsed lines — insisting the protocol shape held. */
 const snapshot = async (args: string[], python = 'python3') => {
-  const outcome = await runChild(python, args, {
-    deadline: Date.now() + 10_000,
+  const pending = runChild(python, args, {
+    deadline: Date.now() + 5_000,
     termGraceMs: 200,
     killGraceMs: 200,
     spawn,
     now: Date.now,
     maxOutputBytes: 1_000_000,
   });
+  running.push(pending);
+  const outcome: ChildOutcome = await pending;
   expect(outcome).toMatchObject({ kind: 'closed', exitCode: 0 });
   const stdout = (outcome as { evidence: { stdout: string } }).evidence.stdout;
   expect(stdout.endsWith('\n')).toBe(true);
@@ -68,6 +88,45 @@ const shimmed = (base: string, name: string, patch: string) => {
     { mode: 0o755 },
   );
   return shim;
+};
+
+/**
+ * Patch for a shim: before the real `os.<fn>` of `name`, write `<dir>/reached` and wait (bounded)
+ * for `<dir>/go`, so the test can change the tree at exactly that point. SIGTERM, if `onSigterm`,
+ * ends the wait instead of killing the helper, which then walks on and writes during termination.
+ */
+const barrier = (fn: 'stat' | 'open', name: string, dir: string, onSigterm = false) =>
+  [
+    'import signal, time',
+    'stop = []',
+    onSigterm ? 'signal.signal(signal.SIGTERM, lambda *a: stop.append(1))' : '',
+    `real, touch = os.${fn}, os.open`,
+    'def gated(path, *a, **k):',
+    `    if path == ${JSON.stringify(name)}:`,
+    `        os.close(touch(${JSON.stringify(join(dir, 'reached'))}, os.O_CREAT | os.O_WRONLY))`,
+    '        until = time.monotonic() + 5',
+    `        while not stop and not os.access(${JSON.stringify(join(dir, 'go'))}, os.F_OK) and time.monotonic() < until:`,
+    '            time.sleep(0.005)',
+    '    return real(path, *a, **k)',
+    `os.${fn} = gated`,
+    'os.supports_dir_fd.add(gated)',
+    'os.supports_follow_symlinks.add(gated)',
+  ].join('\n');
+
+/** Wait, bounded, until the helper has reached its barrier. */
+const reached = async (dir: string) => {
+  const until = Date.now() + 5_000;
+  while (!existsSync(join(dir, 'reached'))) {
+    if (Date.now() > until) throw new Error('the helper never reached its barrier');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+};
+
+/** Directories `d/d/…` nested `levels` deep under `root`; returns the deepest path, relative. */
+const nest = (root: string, levels: number) => {
+  const relative = Array.from({ length: levels }, () => 'd').join('/');
+  mkdirSync(join(root, relative), { recursive: true });
+  return relative;
 };
 
 describe('the snapshot helper', () => {
@@ -242,5 +301,200 @@ describe('the snapshot helper', () => {
       'projects: close failed: Bad file descriptor',
       'root: close failed: Bad file descriptor',
     ]);
+  });
+});
+
+describe('the snapshot helper while the tree changes under it', () => {
+  it.each([
+    [
+      'removed between listing and stat',
+      'stat',
+      (root: string) => rmSync(join(root, 'projects'), { recursive: true }),
+      ['link'],
+      'projects: cannot stat: No such file or directory',
+    ],
+    [
+      'removed between stat and open',
+      'open',
+      (root: string) => rmSync(join(root, 'projects'), { recursive: true }),
+      ['link', 'projects'],
+      'projects: cannot open directory: No such file or directory',
+    ],
+    [
+      'swapped for a symlink between stat and open',
+      'open',
+      (root: string, base: string) => {
+        renameSync(join(root, 'projects'), join(base, 'moved'));
+        symlinkSync(join(base, 'moved'), join(root, 'projects'));
+      },
+      ['link', 'projects'],
+      'projects: cannot open directory: Not a directory',
+    ],
+    [
+      'swapped for another directory between stat and open',
+      'open',
+      (root: string, base: string) => {
+        renameSync(join(root, 'projects'), join(base, 'moved')); // kept, so its inode is not reused
+        mkdirSync(join(root, 'projects'));
+      },
+      ['link', 'projects'],
+      'projects: changed between stat and open',
+    ],
+  ] as const)('never lists a directory %s', async (_label, fn, change, paths, message) => {
+    const t = tree();
+    const pending = snapshot(
+      [HELPER, '--root', t.root, '--cap', '100'],
+      shimmed(t.base, 'python3-barrier', barrier(fn, 'projects', t.base)),
+    );
+    pending.catch(() => undefined); // awaited below; a failure before then is reported there
+    await reached(t.base);
+    change(t.root, t.base);
+    writeFileSync(join(t.base, 'go'), '');
+    const s = await pending;
+    expect(s.entries.map((e) => e['path'])).toEqual(paths);
+    expect(s.diagnostics.map((d) => d['message'])).toEqual([message]);
+    expect(s.complete).toBe(false);
+  });
+
+  it.skipIf(process.getuid?.() === 0).each([
+    [
+      'a directory',
+      'projects',
+      ['link', 'projects'],
+      'projects: cannot open directory: Permission denied',
+    ],
+    ['the root', '', [], 'cannot open root: Permission denied'],
+  ])('reports %s it may not read, without listing it', async (_label, relative, paths, message) => {
+    const t = tree();
+    const target = join(t.root, relative);
+    chmodSync(target, 0o000);
+    locked.push(target); // restored before the tree is deleted, even if an assertion fails
+    const s = await run(t.root);
+    expect(s.entries.map((e) => e['path'])).toEqual(paths);
+    expect(s.diagnostics.map((d) => d['message'])).toEqual([message]);
+    expect(s.complete).toBe(false);
+  });
+
+  it('reports a listing that fails', async () => {
+    const t = tree();
+    const shim = shimmed(
+      t.base,
+      'python3-list-fails',
+      [
+        'import errno',
+        'def failing(fd): raise OSError(errno.EIO, os.strerror(errno.EIO))',
+        'os.scandir = failing',
+        'os.supports_fd.add(failing)',
+      ].join('\n'),
+    );
+    const s = await snapshot([HELPER, '--root', t.root, '--cap', '100'], shim);
+    expect(s.entries).toEqual([]);
+    expect(s.diagnostics.map((d) => d['message'])).toEqual(['.: cannot list: Input/output error']);
+    expect(s.complete).toBe(false);
+  });
+
+  it.each([
+    ['the deepest allowed tree', 64, true],
+    ['one level beyond it', 65, false],
+  ])('opens %s only down to depth 64', async (_label, levels, complete) => {
+    const t = tree();
+    const deep = mkdtempSync(join(t.base, 'deep-'));
+    const deepest = nest(deep, levels);
+    const shim = shimmed(
+      t.base,
+      'python3-count-opens',
+      [
+        'real_open = os.open',
+        'def counted(path, *a, **k):',
+        '    sys.stderr.write("opened\\n")',
+        '    return real_open(path, *a, **k)',
+        'os.open = counted',
+        'os.supports_dir_fd.add(counted)',
+      ].join('\n'),
+    );
+    const s = await snapshot([HELPER, '--root', deep, '--cap', '100'], shim);
+    expect(s.entries.map((e) => e['path'])).toEqual(
+      Array.from({ length: levels }, (_, i) => deepest.slice(0, 2 * i + 1)),
+    );
+    // the root and the 64 directories below it; a 65th is recorded but refused before any open
+    expect(s.stderr.split('\n').filter((l) => l === 'opened')).toHaveLength(65);
+    expect(s.diagnostics.map((d) => d['message'])).toEqual(
+      complete ? [] : [`${deepest}: depth_reached: not opened beyond depth 64`],
+    );
+    expect(s.complete).toBe(complete);
+  });
+});
+
+describe('a real helper bounded by takeSnapshot', () => {
+  const take = (root: string, python: string, withinMs: number, maxLineBytes = 4_096) => {
+    const pending = takeSnapshot(root, {
+      deadline: Date.now() + withinMs,
+      cap: 100,
+      maxOutputBytes: 1_000_000,
+      maxLineBytes,
+      python,
+    });
+    running.push(pending);
+    let settled = false;
+    void pending.then(() => (settled = true));
+    return { pending, settled: () => settled };
+  };
+
+  it('keeps what streamed before a deadline that stopped the walk at its barrier', async () => {
+    const t = tree();
+    const run = take(
+      t.root,
+      shimmed(t.base, 'python3-stuck', barrier('stat', 'projects', t.base)),
+      1_500,
+    );
+    await reached(t.base);
+    expect(run.settled()).toBe(false); // reached mid-walk before termination, not a slow start
+    const s = await run.pending;
+    expect(s.entries.map((e) => e.path)).toEqual(['link']);
+    expect(s.problems).toEqual([
+      'the helper was killed by SIGTERM',
+      'the helper exited null',
+      'the helper was signalled to stop',
+      'the stream has no done',
+    ]);
+    expect(s.complete).toBe(false);
+  });
+
+  it('retains output written during termination, which cannot make the snapshot complete', async () => {
+    const t = tree();
+    const shim = shimmed(
+      t.base,
+      'python3-finishes-on-sigterm',
+      barrier('stat', 'projects', t.base, true),
+    );
+    const run = take(t.root, shim, 1_500);
+    await reached(t.base);
+    expect(run.settled()).toBe(false);
+    const s = await run.pending;
+    // everything past link was observed only after SIGTERM released the barrier
+    expect(s.entries.map((e) => e.path)).toEqual([
+      'link',
+      'projects',
+      'projects/slug',
+      'projects/slug/a.jsonl',
+    ]);
+    expect(s.problems).toEqual(['the helper was signalled to stop']);
+    expect(s.complete).toBe(false);
+    const settled = structuredClone(s);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(s).toEqual(settled);
+  });
+
+  it('refuses a real entry line longer than the line bound', async () => {
+    const t = tree();
+    const root = mkdtempSync(join(t.base, 'long-'));
+    writeFileSync(join(root, 'n'.repeat(255)), '');
+    const s = await take(root, 'python3', 5_000, 256).pending;
+    expect(s.entries).toEqual([]);
+    expect(s.problems).toEqual([
+      'line 1: longer than 256 bytes',
+      'done.entries does not match the entries sent',
+    ]);
+    expect(s.complete).toBe(false);
   });
 });

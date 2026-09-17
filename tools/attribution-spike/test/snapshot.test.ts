@@ -31,6 +31,7 @@ interface Script {
 /** A helper that answers as scripted and records how it was invoked. */
 const fakeHelper = (script: Script) => {
   const argv: string[][] = [];
+  const children: EventEmitter[] = [];
   let spawns = 0;
   const stub = ((_cmd: string, args: string[]) => {
     spawns += 1;
@@ -51,6 +52,7 @@ const fakeHelper = (script: Script) => {
         return true;
       },
     });
+    children.push(child);
     queueMicrotask(() => {
       child.emit('spawn');
       if (script.stdout) child.stdout.emit('data', Buffer.from(script.stdout));
@@ -61,7 +63,7 @@ const fakeHelper = (script: Script) => {
     });
     return child;
   }) as unknown as typeof spawn;
-  return { spawn: stub, argv, spawns: () => spawns };
+  return { spawn: stub, argv, children, spawns: () => spawns };
 };
 
 const made: string[] = [];
@@ -266,7 +268,7 @@ describe('what the helper’s termination adds', () => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
       vi.setSystemTime(1_000_000);
       const h = fakeHelper(script);
-      const state: { s?: Awaited<ReturnType<typeof takeSnapshot>> } = {};
+      const state: { s?: Awaited<ReturnType<typeof takeSnapshot>>; h: typeof h } = { h };
       void takeSnapshot('/root', { ...LIMITS, deadline: D, spawn: h.spawn }).then(
         (s) => (state.s = s),
       );
@@ -289,6 +291,15 @@ describe('what the helper’s termination adds', () => {
       expect(state.s?.complete).toBe(false);
       expect(state.s?.problems[0]).toBe('the helper ended exited');
       expect(state.s?.entries.map((e) => e.path)).toEqual(['a']);
+
+      // output after settlement: the pipes finally deliver a valid rest and close. Nothing changes.
+      const settled = structuredClone(state.s);
+      const child = state.h.children[0] as EventEmitter & { stdout: EventEmitter };
+      child.stdout.emit('data', Buffer.from(entry('late') + done(2)));
+      child.emit('close', 0, null);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(state.s).toEqual(settled);
+      expect(Object.isFrozen(state.s?.problems)).toBe(true);
     });
 
     it('keeps what a hanging helper streamed, and is incomplete at the deadline', async () => {

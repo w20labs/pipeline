@@ -8,6 +8,10 @@ Only directories are opened, and only to list them, each relative to its parent 
 O_DIRECTORY|O_NOFOLLOW and checked against the device and inode stat'd a moment before. Files are
 never opened; link targets are never resolved.
 
+DEPTH: the root is depth 0 and an entry's depth is its number of path segments. Directories down to
+MAX_DEPTH are opened and listed; a directory deeper than that is recorded but never opened, with a
+depth_reached diagnostic, so recursion and open descriptors stay bounded by MAX_DEPTH + 1.
+
 PROTOCOL, one JSON object per line on stdout, exit status 0:
   {"type": "entry", "path": str, "kind": "file"|"dir"|"symlink"|"other",
    "size": str, "mtimeNs": str, "dev": str, "ino": str}
@@ -24,6 +28,7 @@ import os
 import stat
 import sys
 
+MAX_DEPTH = 64
 counts = {"entries": 0, "diagnostics": 0}
 complete = True
 
@@ -75,7 +80,7 @@ def close(fd, what):
         diagnose(what + ": close failed: " + os.strerror(error.errno))
 
 
-def walk(fd, prefix, cap, flags):
+def walk(fd, prefix, depth, cap, flags):
     # Enumeration itself is bounded: at most one name past what the cap still allows is read from
     # this directory, so a huge directory cannot be materialised. Memory is then bounded by
     # (cap + 1) names per directory level being walked. Order is sorted within what was read.
@@ -105,6 +110,9 @@ def walk(fd, prefix, cap, flags):
               "mtimeNs": str(st.st_mtime_ns), "dev": str(st.st_dev), "ino": str(st.st_ino)})
         if kind != "dir":
             continue
+        if depth + 1 > MAX_DEPTH:
+            diagnose(path + ": depth_reached: not opened beyond depth " + str(MAX_DEPTH))
+            continue
         try:
             child = os.open(name, flags, dir_fd=fd)
         except OSError as error:
@@ -119,7 +127,7 @@ def walk(fd, prefix, cap, flags):
             if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
                 diagnose(path + ": changed between stat and open")
             else:
-                walk(child, path, cap, flags)
+                walk(child, path, depth + 1, cap, flags)
         finally:
             close(child, path)  # runs on every path above, the fstat failure included
 
@@ -142,7 +150,7 @@ def main(argv):
                 diagnose("cannot open root: " + os.strerror(error.errno))
             else:
                 try:
-                    walk(fd, "", int(cap_text), flags)
+                    walk(fd, "", 0, int(cap_text), flags)
                 except CapReached:
                     diagnose("cap_reached: stopped after " + cap_text + " entries")
                 finally:
