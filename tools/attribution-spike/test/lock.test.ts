@@ -298,12 +298,96 @@ describe('taking the lock through the helper', () => {
       line({ kind: 'held', diagnostics: [{ step: 'nope', errno: null }] }),
       'diagnostics are malformed',
     ],
+    ['no output at all', '', 'the output is not exactly one line'],
+    [
+      'a line without its newline',
+      JSON.stringify({ kind: 'held', diagnostics: [] }),
+      'the output is not exactly one line',
+    ],
+    ['text that is not JSON', 'not json\n', 'the output is not JSON'],
+    ['null', 'null\n', 'the output is not an object'],
+    ['an array', '[]\n', 'the output is not an object'],
+    ['a number', '7\n', 'the output is not an object'],
+    ['a string', '"held"\n', 'the output is not an object'],
+    [
+      'a kind inherited from Object',
+      line({ kind: 'toString', diagnostics: [] }),
+      'kind is unknown',
+    ],
+    ['a non-string kind', line({ kind: 7, diagnostics: [] }), 'kind is unknown'],
+    [
+      'held with an extra field',
+      line({ kind: 'held', diagnostics: [], errno: null }),
+      'the held result has the wrong fields',
+    ],
+    [
+      'refused without its errno',
+      line({ kind: 'refused', reason: 'capability', diagnostics: [] }),
+      'the refused result has the wrong fields',
+    ],
+    [
+      'an unknown reason',
+      line({ kind: 'refused', reason: 'confused', errno: null, diagnostics: [] }),
+      'reason is unknown',
+    ],
+    [
+      'a null reason',
+      line({ kind: 'refused', reason: null, errno: null, diagnostics: [] }),
+      'reason is unknown',
+    ],
+    [
+      'a lowercase errno',
+      line({ kind: 'refused', reason: 'link_failed', errno: 'exdev', diagnostics: [] }),
+      'errno is malformed',
+    ],
+    [
+      'an errno with trailing text',
+      line({ kind: 'refused', reason: 'link_failed', errno: 'EXDEV now', diagnostics: [] }),
+      'errno is malformed',
+    ],
+    [
+      'a numeric errno',
+      line({ kind: 'refused', reason: 'link_failed', errno: 18, diagnostics: [] }),
+      'errno is malformed',
+    ],
+    [
+      'diagnostics that are not an array',
+      line({ kind: 'held', diagnostics: {} }),
+      'diagnostics are malformed',
+    ],
+    ['a null diagnostic', line({ kind: 'held', diagnostics: [null] }), 'diagnostics are malformed'],
+    [
+      'a diagnostic with an extra key',
+      line({ kind: 'held', diagnostics: [{ step: 'close_lock', errno: null, why: 'x' }] }),
+      'diagnostics are malformed',
+    ],
+    [
+      'a diagnostic step inherited from Object',
+      line({ kind: 'held', diagnostics: [{ step: 'toString', errno: null }] }),
+      'diagnostics are malformed',
+    ],
+    [
+      'a diagnostic with a lowercase errno',
+      line({ kind: 'held', diagnostics: [{ step: 'close_lock', errno: 'ebadf' }] }),
+      'diagnostics are malformed',
+    ],
   ])('reports unknown for %s', async (_label, stdout, problem) => {
     const { outcome } = await take({ stdout });
     expect(outcome).toEqual({
       kind: 'unknown',
       handle: { controlDir: DIR, runId: 'run-1' },
       problems: [problem],
+    });
+  });
+
+  it('accepts an acquisition that also reports a cleanup problem', async () => {
+    // the control for the table above: a valid line with diagnostics is published, not refused
+    const stdout = line({ kind: 'acquired', diagnostics: [{ step: 'unlink_temp', errno: 'EIO' }] });
+    const { outcome } = await take({ stdout });
+    expect(outcome).toEqual({
+      kind: 'acquired',
+      handle: { controlDir: DIR, runId: 'run-1' },
+      diagnostics: [{ step: 'unlink_temp', errno: 'EIO' }],
     });
   });
 
