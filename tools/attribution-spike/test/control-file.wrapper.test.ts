@@ -1,7 +1,7 @@
 import type { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   CONTROL_HELPER,
@@ -24,13 +24,26 @@ interface Script {
   throws?: Error;
   /** Emit this error before `spawn`, after any scripted output. */
   errorBeforeSpawn?: Error;
-  /** Never exit on its own; exit 0 once asked to stop. */
-  exitOnSigterm?: boolean;
+  /** 'close' (default): exit, then close. 'exit-only': exit with the streams held open. 'never': no end of its own. */
+  end?: 'close' | 'exit-only' | 'never';
+  /** What the helper does when a signal arrives; a signal not listed here is ignored. */
+  onSignal?: Partial<Record<'SIGTERM' | 'SIGKILL', Ending & { readonly stdout?: string }>>;
+}
+interface Ending {
+  readonly exit: number | null;
+  readonly signal: string | null;
+  readonly close: boolean;
 }
 
-/** A helper that answers as scripted, records its argv, and runs `during` once spawned. */
+/** A helper that answers as scripted, records its argv and the signals it receives, and runs `during` once spawned. */
 const fakeHelper = (script: Script, during?: () => void) => {
   const argv: string[][] = [];
+  const signals: string[] = [];
+  const children: (EventEmitter & { stdout: EventEmitter })[] = [];
+  const end = (child: EventEmitter, { exit, signal, close }: Ending) => {
+    child.emit('exit', exit, signal);
+    if (close) child.emit('close', exit, signal);
+  };
   const stub = ((_cmd: string, args: string[]) => {
     argv.push(args);
     if (script.throws !== undefined) throw script.throws;
@@ -39,12 +52,19 @@ const fakeHelper = (script: Script, during?: () => void) => {
       stdout: stream(),
       stderr: stream(),
       unref: () => undefined,
-      kill: () => {
-        if (script.exitOnSigterm === true)
-          queueMicrotask(() => (child.emit('exit', 0, null), child.emit('close', 0, null)));
+      kill: (signal: 'SIGTERM' | 'SIGKILL') => {
+        signals.push(signal);
+        const response = script.onSignal?.[signal];
+        if (response !== undefined)
+          queueMicrotask(() => {
+            if (response.stdout !== undefined)
+              child.stdout.emit('data', Buffer.from(response.stdout));
+            end(child, response);
+          });
         return true;
       },
     });
+    children.push(child);
     during?.();
     queueMicrotask(() => {
       if (script.stderr !== undefined) child.stderr.emit('data', Buffer.from(script.stderr));
@@ -52,13 +72,14 @@ const fakeHelper = (script: Script, during?: () => void) => {
       if (script.errorBeforeSpawn !== undefined)
         return void child.emit('error', script.errorBeforeSpawn);
       child.emit('spawn');
-      if (script.exitOnSigterm === true) return;
-      child.emit('exit', script.exit ?? 0, script.signal ?? null);
-      child.emit('close', script.exit ?? 0, script.signal ?? null);
+      if (script.end === 'never') return;
+      // an explicit null is kept: only an absent exit code defaults to 0
+      const exit = script.exit === undefined ? 0 : script.exit;
+      end(child, { exit, signal: script.signal ?? null, close: script.end !== 'exit-only' });
     });
     return child;
   }) as unknown as typeof spawn;
-  return { spawn: stub, argv };
+  return { spawn: stub, argv, signals, children };
 };
 const read = (script: Script, over: object = {}, name = 'bootstrap.json') => {
   const h = fakeHelper(script);
@@ -198,7 +219,7 @@ describe('reading a control file through the helper', () => {
     [
       'a signal after a valid read',
       { stdout: READ, exit: null, signal: 'SIGSEGV' },
-      ['the helper was killed by SIGSEGV'],
+      ['the helper was killed by SIGSEGV', 'the helper exited null'], // no exit code when killed
     ],
     [
       'stderr beside a valid read',
@@ -246,7 +267,8 @@ describe('reading a control file through the helper', () => {
     const script = {
       stderr: 'warn\n',
       stdout: 'x'.repeat(maxOutputBytesFor(64) + 1),
-      exitOnSigterm: true,
+      end: 'never' as const,
+      onSignal: { SIGTERM: { exit: 0, signal: null, close: true } },
     };
     expect(await read(script).result).toEqual({
       kind: 'unusable',
@@ -259,4 +281,109 @@ describe('reading a control file through the helper', () => {
       ],
     });
   });
+});
+
+describe('reading a control file on controlled time', () => {
+  afterEach(() => vi.useRealTimers());
+  const T0 = 1_000_000;
+  const D = T0 + 10_000;
+  // runChild's schedule: SIGTERM once only both grace periods remain, SIGKILL once only the kill grace does
+  const SIGTERM_AT = D - 400;
+  const SIGKILL_AT = D - 200;
+  const killed = { exit: null, signal: 'SIGKILL' };
+
+  it.each([
+    {
+      // exit proves the helper ended, but its output is incomplete without close; exit already seen, so no signal
+      label: 'exits 0 after a valid read but never closes its streams',
+      script: { stdout: READ, end: 'exit-only' },
+      settlesAt: D,
+      signals: [],
+      problems: ['the helper ended exited'],
+    },
+    {
+      // closed with exit 0, yet it only finished because it was told to stop
+      label: 'answers SIGTERM with a valid read, exit 0 and close',
+      script: {
+        end: 'never',
+        onSignal: { SIGTERM: { stdout: READ, exit: 0, signal: null, close: true } },
+      },
+      settlesAt: SIGTERM_AT,
+      signals: ['SIGTERM'],
+      problems: ['the helper was signalled to stop'],
+    },
+    {
+      // no exit event ever arrives: sending SIGKILL and reaching the deadline are not an exit
+      label: 'ignores SIGTERM and SIGKILL',
+      script: { end: 'never' },
+      settlesAt: D,
+      signals: ['SIGTERM', 'SIGKILL'],
+      problems: [
+        'the helper ended unterminated',
+        'the helper was signalled to stop',
+        'the output is not exactly one line',
+      ],
+    },
+    {
+      // the exit event proves exit; with close as well, the outcome is closed and carries the signal
+      label: 'exits and closes on SIGKILL',
+      script: { end: 'never', onSignal: { SIGKILL: { ...killed, close: true } } },
+      settlesAt: SIGKILL_AT,
+      signals: ['SIGTERM', 'SIGKILL'],
+      problems: [
+        'the helper was killed by SIGKILL',
+        'the helper exited null',
+        'the helper was signalled to stop',
+        'the output is not exactly one line',
+      ],
+    },
+    {
+      // the exit event proves exit, but without close the outcome is exited, reported only at the deadline
+      label: 'exits on SIGKILL but never closes its streams',
+      script: { end: 'never', onSignal: { SIGKILL: { ...killed, close: false } } },
+      settlesAt: D,
+      signals: ['SIGTERM', 'SIGKILL'],
+      problems: [
+        'the helper ended exited',
+        'the helper was signalled to stop',
+        'the output is not exactly one line',
+      ],
+    },
+  ] as {
+    label: string;
+    script: Script;
+    settlesAt: number;
+    signals: string[];
+    problems: string[];
+  }[])(
+    'returns no bytes when the helper $label, and late output changes nothing',
+    async ({ script, settlesAt, signals, problems }) => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      vi.setSystemTime(T0);
+      const h = fakeHelper(script);
+      let result: Awaited<ReturnType<typeof readControlFile>> | undefined;
+      void readControlFile('/control', 'f', {
+        deadline: D,
+        cap: 64,
+        spawn: h.spawn,
+        now: Date.now,
+      }).then((r) => (result = r));
+      await vi.advanceTimersByTimeAsync(settlesAt - T0 - 1);
+      expect(result).toBeUndefined(); // not a millisecond early
+      await vi.advanceTimersByTimeAsync(1);
+      expect(result).toEqual({ kind: 'unusable', problems });
+      expect(h.signals).toEqual(signals);
+
+      const settled = structuredClone(result);
+      const child = h.children[0];
+      child?.stdout.emit('data', Buffer.from(READ));
+      child?.emit('exit', 0, null);
+      child?.emit('close', 0, null);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(result).toEqual(settled);
+      expect(
+        Object.isFrozen(result) && result?.kind === 'unusable' && Object.isFrozen(result.problems),
+      ).toBe(true);
+    },
+  );
 });
