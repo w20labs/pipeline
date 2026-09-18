@@ -14,6 +14,8 @@ import type { spawn as nodeSpawn } from 'node:child_process';
 import { readControlFile } from './control-file.js';
 import { type LockDeps, lockPhase } from './lock-phase.js';
 import { manifestPhase } from './manifest.js';
+import { snapshotPhase } from './snapshot-phase.js';
+import type { Snapshot } from './snapshot.js';
 import type { LockOwner } from './lock.js';
 import {
   nodeRunnerFs,
@@ -24,11 +26,82 @@ import {
   runResearch,
 } from './runner.js';
 
-const RESERVED = ['lock', 'manifest'] as const;
+const RESERVED = ['lock', 'manifest', 'snapshot'] as const;
+
+/** What a supplied phase may ask the run about. Frozen, and answering from the phase that owns it. */
+export interface RunContext {
+  /** The baseline exactly as taken — partial entries included — or `undefined` before the walk. */
+  readonly baseline: () => Snapshot | undefined;
+}
+/** Phases to run after the run's own, or a function given the context once, before the run starts. */
+export type SuppliedPhases = readonly Phase[] | ((context: RunContext) => readonly Phase[]);
+
+const FAILED = 'failed';
+
+type Settler = (ok: () => void, failed: () => void) => unknown;
+const quietly = (work: unknown, then: Settler) =>
+  then.call(
+    work,
+    () => undefined,
+    () => undefined,
+  );
+
+/**
+ * Whether the value is a thenable, and if so, observed. `then` is read once and called with
+ * handlers, and what that call returns is observed too: an `async then` rejects the promise it
+ * returns, which promise adoption would discard, leaving that rejection unhandled.
+ *
+ * What this covers is the value itself and the promise its `then` returned. It cannot contain
+ * arbitrary work a caller starts — a `then` that schedules its own chain, or a timer that rejects
+ * something later, is beyond any boundary here. Reading or calling `then` may throw; the caller
+ * runs this inside its own guard, where a throw means the same as any other malformed value.
+ */
+const observedThenable = (value: unknown): boolean => {
+  const then = (value as { then?: unknown } | null | undefined)?.then;
+  if (typeof then !== 'function') return false;
+  const returned: unknown = quietly(value, then as Settler);
+  // never re-read value.then: what came back is a separate object with its own settlement
+  const settling = (returned as { then?: unknown } | null | undefined)?.then;
+  if (typeof settling === 'function') quietly(returned, settling as Settler);
+  return true;
+};
+
+/**
+ * Calls the caller's code, if any, and copies what it returns — all inside one boundary. Each
+ * entry's `name`, `run` and `cleanup` is read exactly once here, so a throwing getter is a
+ * malformed value like any other, and nothing the caller wrote is repeated.
+ */
+const supplyPhases = (
+  supplied: SuppliedPhases | undefined,
+  context: RunContext,
+): Phase[] | typeof FAILED => {
+  try {
+    const list: unknown = typeof supplied === 'function' ? supplied(context) : (supplied ?? []);
+    if (observedThenable(list)) return FAILED; // an async callback: refused, never awaited
+    if (!Array.isArray(list)) return FAILED;
+    const copied: Phase[] = [];
+    for (const entry of list as unknown[]) {
+      if (typeof entry !== 'object' || entry === null) return FAILED;
+      const { name, run, cleanup } = entry as Partial<Phase>;
+      if (typeof name !== 'string' || typeof run !== 'function') return FAILED;
+      if (cleanup !== undefined && typeof cleanup !== 'function') return FAILED;
+      copied.push(
+        Object.freeze({
+          name,
+          run: run.bind(entry),
+          ...(cleanup === undefined ? {} : { cleanup: cleanup.bind(entry) }),
+        }),
+      );
+    }
+    return copied;
+  } catch {
+    return FAILED;
+  }
+};
 
 export interface ResearchRunOptions {
   /** Phases to run after the lock, in order. The lock is always first and cannot be replaced. */
-  readonly after?: readonly Phase[];
+  readonly after?: SuppliedPhases;
   readonly python?: string;
   readonly spawn?: typeof nodeSpawn;
   /**
@@ -68,15 +141,7 @@ export const researchRun = async (
     budgetMs: config.budgetMs,
     cleanupReserveMs: config.cleanupReserveMs,
   });
-  const after: readonly Phase[] = Object.freeze(
-    (options.after ?? []).map((p) =>
-      Object.freeze({
-        name: p.name,
-        run: p.run.bind(p),
-        ...(p.cleanup === undefined ? {} : { cleanup: p.cleanup.bind(p) }),
-      }),
-    ),
-  );
+  const supplied = options.after; // read before any caller code runs, with everything else
   // the methods too, bound to the object that supplied them: replacing one mid-run changes nothing
   const given = options.fs ?? nodeRunnerFs;
   const fs: RunnerFs = Object.freeze({
@@ -90,13 +155,6 @@ export const researchRun = async (
   const injected = options.lock;
   const acquire = injected?.acquire;
   const release = injected?.release;
-
-  const claimed = after.find((p) => (RESERVED as readonly string[]).includes(p.name));
-  if (claimed !== undefined)
-    return refusedBeforeStart(
-      after.map((p) => p.name),
-      `a supplied phase may not be named ${claimed.name}`,
-    );
 
   const owner: LockOwner = Object.freeze({
     runId: c.runId,
@@ -121,7 +179,20 @@ export const researchRun = async (
   );
   const manifest = manifestPhase(
     { controlDir: c.controlDir, researchConfig: c.researchConfig },
-    (dir, name, options) => readControlFile(dir, name, { ...options, ...bounds }),
+    (dir, name, readOptions) => readControlFile(dir, name, { ...readOptions, ...bounds }),
   );
-  return runResearch(c, [lock, manifest, ...after], fs, now);
+  const snapshot = snapshotPhase({ root: c.researchConfig }, bounds);
+
+  // caller code runs only now, with every input already captured, and exactly once
+  const context: RunContext = Object.freeze({ baseline: () => snapshot.taken() });
+  const after = supplyPhases(supplied, context);
+  const built = RESERVED.map((name) => name);
+  if (after === FAILED) return refusedBeforeStart(built, 'the supplied phases could not be built');
+  const claimed = after.find((p) => (RESERVED as readonly string[]).includes(p.name));
+  if (claimed !== undefined)
+    return refusedBeforeStart(
+      [...built, ...after.map((p) => p.name)],
+      `a supplied phase may not be named ${claimed.name}`,
+    );
+  return runResearch(c, [lock, manifest, snapshot.phase, ...after], fs, now);
 };

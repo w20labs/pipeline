@@ -17,8 +17,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { acquireLockBounded, releaseLockBounded } from '../src/lock.js';
 import type { LockDeps } from '../src/lock-phase.js';
-import { researchRun } from '../src/research-run.js';
+import { researchRun, type RunContext } from '../src/research-run.js';
 import type { Phase, RunConfig, RunnerFs, RunResult } from '../src/runner.js';
+import type { Snapshot } from '../src/snapshot.js';
 
 /** A composed run driving the real lock helper. Every process here is the test's own child. */
 
@@ -204,6 +205,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'completed'],
+      ['snapshot', 'completed'],
       ['observe', 'completed'],
     ]);
     expect(result.phases[0]).toMatchObject({
@@ -225,10 +227,12 @@ describe('a composed run', () => {
     expect(status(summary)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'completed'],
+      ['snapshot', 'completed'],
       ['observe', 'completed'],
     ]);
-    expect(tracked).toHaveLength(3); // acquisition, the manifest read, release
+    expect(tracked).toHaveLength(4); // acquisition, the manifest read, the walk, release
     expect(tracked.map((t) => [t.exit?.code, t.kills])).toEqual([
+      [0, []],
       [0, []],
       [0, []],
       [0, []],
@@ -253,6 +257,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'refused'],
       ['manifest', 'not_run'],
+      ['snapshot', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]); // nothing ran behind a lock this run does not hold
@@ -318,6 +323,7 @@ describe('a composed run', () => {
     expect(status(ordered)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'completed'],
+      ['snapshot', 'completed'],
       ['first', 'completed'],
       ['second', 'completed'],
     ]);
@@ -329,7 +335,11 @@ describe('a composed run', () => {
     });
     expect(claimed).toEqual({
       outcome: { name: 'start', status: 'refused', why: 'a supplied phase may not be named lock' },
-      phases: [{ name: 'lock', status: 'not_run', why: 'the run did not start' }],
+      phases: ['lock', 'manifest', 'snapshot', 'lock'].map((name) => ({
+        name,
+        status: 'not_run',
+        why: 'the run did not start',
+      })),
       cleanupDiagnostics: [],
       summary: {
         written: false,
@@ -385,6 +395,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'completed'],
+      ['snapshot', 'completed'],
       ['observe', 'completed'],
     ]);
     // the lock identified the run the snapshot named, in the directory it named
@@ -450,7 +461,7 @@ describe('a composed run', () => {
         why: 'the run budget was spent',
       });
       expect(existsSync(join(at.runs, 'run-1', 'run.json'))).toBe(false); // correctly unwritten
-      expect(tracked).toHaveLength(2); // the acquisition and the manifest read; no release
+      expect(tracked).toHaveLength(3); // acquisition, manifest read and walk; no release
       // the lock this run took is still there, which is exactly what the diagnostics say
       expect(JSON.parse(readFileSync(join(at.control, 'run.lock'), 'utf8'))).toMatchObject({
         runId: 'run-1',
@@ -543,11 +554,12 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'completed'],
+      ['snapshot', 'completed'],
     ]);
     expect(result.phases[0]).toMatchObject({ evidence: { runId: 'run-1', diagnostics: [] } });
     expect(result.cleanupDiagnostics).toEqual([]); // the release measured on it too
-    // the interpreter, the spawn and this clock all reached the manifest reader as well
-    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0, 0]);
+    // the interpreter, the spawn and this clock reached the manifest reader and the walk as well
+    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0, 0, 0]);
     expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
   }, 60_000);
 
@@ -720,7 +732,7 @@ describe('a composed run', () => {
       await untilReady('the composed run', () => run.state.done, 15_000);
       const result = await run.work;
 
-      expect(result.phases.map((p) => p.status)).toEqual(['timed_out', 'not_run']);
+      expect(result.phases.map((p) => p.status)).toEqual(['timed_out', 'not_run', 'not_run']);
       expect(result.cleanupDiagnostics).toEqual([]); // reconciled, then released
       expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
       expect(tracked).toHaveLength(2);
@@ -798,6 +810,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'completed'], // validated against the path read the first time
+      ['snapshot', 'completed'],
     ]);
     expect(ran).toEqual([]);
   }, 60_000);
@@ -1012,6 +1025,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'refused'],
+      ['snapshot', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]); // nothing supplied runs without a manifest
@@ -1045,6 +1059,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'refused'],
+      ['snapshot', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]);
@@ -1068,6 +1083,12 @@ describe('a composed run', () => {
       status: 'refused',
       why: 'a supplied phase may not be named manifest',
     });
+    expect(status(claimed).map(([name]) => name)).toEqual([
+      'lock',
+      'manifest',
+      'snapshot',
+      'manifest',
+    ]);
     expect(ran).toEqual([]);
     expect(tracked).toEqual([]); // nothing was started at all
     expect(existsSync(join(at.runs, 'run-1'))).toBe(false);
@@ -1087,9 +1108,9 @@ describe('a composed run', () => {
     const result = await researchRun(configOf(at), { spawn: trackingSpawn, python: shim });
 
     expect(result.outcome).toEqual({ kind: 'completed' });
-    // acquisition, the manifest read and the release all went through the captured interpreter
-    expect(readFileSync(marker, 'utf8')).toBe('xxx');
-    expect(tracked).toHaveLength(3);
+    // acquisition, the manifest read, the walk and the release all used the captured interpreter
+    expect(readFileSync(marker, 'utf8')).toBe('xxxx');
+    expect(tracked).toHaveLength(4);
   }, 60_000);
 
   it('exhausts the phase budget after the lock, leaving the manifest and later work unrun', async () => {
@@ -1121,6 +1142,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'not_run'],
+      ['snapshot', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(result.phases[1]).toMatchObject({ why: 'the run budget was spent' });
@@ -1202,6 +1224,7 @@ describe('a composed run', () => {
     expect(status(result)).toEqual([
       ['lock', 'completed'],
       ['manifest', 'refused'],
+      ['snapshot', 'not_run'],
     ]);
     // the manifest child ignored SIGTERM and was killed; its own exit says so, independently
     expect(tracked).toHaveLength(3);
@@ -1218,5 +1241,286 @@ describe('a composed run', () => {
     expect(result.cleanupDiagnostics).toEqual([]);
     expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
     expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(body);
+  }, 60_000);
+
+  it('calls the supplied builder once, before anything is spawned, with the run’s own inputs held', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const calls: { spawned: number; baseline: unknown }[] = [];
+    const config = configOf(at) as Mutable<RunConfig>;
+    const ran: string[] = [];
+    const observer: Mutable<Phase> = {
+      name: 'observe',
+      run: async () => (ran.push('original'), { kind: 'completed' }),
+    };
+    const built: Phase[] = [observer];
+    const creating = deferred<void>();
+    const release = deferred<void>();
+
+    const run = observed(
+      researchRun(config, {
+        spawn: trackingSpawn,
+        after: (context) => {
+          calls.push({ spawned: tracked.length, baseline: context.baseline() });
+          config.controlDir = at.scratch; // mutating the caller's object now is already too late
+          config.runId = 'moved';
+          return built;
+        },
+        fs: {
+          mkdirExclusive: async (path) => {
+            creating.resolve();
+            await release.promise; // held here: the builder has returned, no phase has run
+            mkdirSync(path);
+          },
+          writeSummary: async (path, text) => writeFileSync(path, text, { flag: 'wx' }),
+        },
+      }),
+    );
+
+    try {
+      await untilReady('the run to reach directory creation', () => calls.length > 0, 20_000);
+      built.push(observing('late', () => ran.push('late'), at.control)); // after the builder returned
+      observer.run = async () => (ran.push('replaced'), { kind: 'completed' });
+      release.resolve();
+      await untilReady('the composed run', () => run.state.done, 20_000);
+      const result = await run.work;
+
+      expect(calls).toEqual([{ spawned: 0, baseline: undefined }]); // once, before any child
+      expect(ran).toEqual(['original']); // the copied list, and the method bound when it was copied
+      expect(status(result).map(([name]) => name)).toEqual([
+        'lock',
+        'manifest',
+        'snapshot',
+        'observe',
+      ]);
+      expect(result.phases[0]).toMatchObject({ evidence: { runId: 'run-1' } });
+      expect(existsSync(join(at.runs, 'run-1', 'run.json'))).toBe(true);
+    } finally {
+      release.resolve(); // whatever happened above, nothing stays held
+      if (!(await confirmed('the composed run', () => run.state.done)))
+        retain(at.base, 'the composed run did not settle');
+    }
+  }, 60_000);
+
+  it.each([
+    [
+      'throws where it is called',
+      () => {
+        throw new Error('SENTINEL-SECRET while building');
+      },
+    ],
+    ['returns something that is not a list', () => ({ name: 'observe' }) as never],
+    ['returns a phase that is not an object', () => ['observe' as never]],
+    [
+      'returns a phase without a name',
+      () => [{ run: async () => ({ kind: 'completed' }) } as never],
+    ],
+    [
+      'returns a phase whose run is not a function',
+      () => [{ name: 'observe', run: 'soon' } as never],
+    ],
+    [
+      'returns a phase whose cleanup is not a function',
+      () => [{ name: 'observe', run: async () => ({ kind: 'completed' }), cleanup: 1 } as never],
+    ],
+    [
+      // bindable, so only validation catches it: binding alone would let it through to the runner
+      'returns a phase whose cleanup merely looks bindable',
+      () =>
+        [
+          {
+            name: 'observe',
+            run: async () => ({ kind: 'completed' }),
+            cleanup: { bind: () => 'not a function' },
+          },
+        ] as never,
+    ],
+    [
+      'returns a phase whose name throws when read',
+      () =>
+        [
+          {
+            get name(): string {
+              throw new Error('SENTINEL-SECRET from a getter');
+            },
+            run: async () => ({ kind: 'completed' }),
+          },
+        ] as never,
+    ],
+  ])(
+    'refuses before starting when the builder %s',
+    async (_label, after) => {
+      const at = workspace();
+      bootstrapManifest(at);
+      const result = await researchRun(configOf(at), {
+        spawn: trackingSpawn,
+        after: after as never,
+      });
+
+      expect(result.outcome).toEqual({
+        name: 'start',
+        status: 'refused',
+        why: 'the supplied phases could not be built',
+      });
+      expect(JSON.stringify(result)).not.toContain('SENTINEL');
+      expect(status(result).map(([name]) => name)).toEqual(['lock', 'manifest', 'snapshot']);
+      expect(tracked).toEqual([]); // nothing was started
+      expect(existsSync(join(at.runs, 'run-1'))).toBe(false);
+      expect(readdirSync(at.control)).toEqual(['bootstrap.json']); // and nothing was touched
+    },
+    60_000,
+  );
+
+  it('refuses an accidentally asynchronous builder, and leaves no rejection unobserved', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const unhandled: unknown[] = [];
+    const watch = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', watch);
+    try {
+      const result = await researchRun(configOf(at), {
+        spawn: trackingSpawn,
+        after: (async () => {
+          throw new Error('SENTINEL-SECRET from an async builder');
+        }) as never,
+      });
+      expect(result.outcome).toMatchObject({
+        status: 'refused',
+        why: 'the supplied phases could not be built',
+      });
+      expect(tracked).toEqual([]); // refused without awaiting it, and without starting anything
+      await sleepReal(100); // a turn in which an unobserved rejection would have surfaced
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', watch);
+    }
+  }, 60_000);
+
+  it('hands later phases the identical baseline, while its own evidence carries only counts', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    writeFileSync(join(at.research, 'notes.txt'), 'observed\n');
+    const seen: { first?: unknown; second?: unknown } = {};
+
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      after: (context) => [
+        {
+          name: 'observe',
+          run: async () => {
+            seen.first = context.baseline();
+            seen.second = context.baseline();
+            // a supplied phase may report whatever it likes, entries included: this boundary is
+            // about what the run writes on its own, not about what a caller chooses to return
+            return {
+              kind: 'completed',
+              evidence: { entries: (seen.first as Snapshot).entries.length },
+            };
+          },
+        },
+      ],
+    });
+
+    expect(seen.first).toBe(seen.second); // the same object, not a copy per call
+    const baseline = seen.first as Snapshot;
+    expect(baseline.complete).toBe(true);
+    expect(baseline.entries.map((e) => e.path)).toContain('notes.txt');
+    expect(Object.isFrozen(baseline)).toBe(true);
+    // the phase's own evidence names counts and nothing else
+    expect(result.phases[2]).toMatchObject({
+      name: 'snapshot',
+      evidence: { root: at.research, entries: baseline.entries.length, complete: true },
+    });
+    const written = readFileSync(join(at.runs, 'run-1', 'run.json'), 'utf8');
+    expect(written).not.toContain('notes.txt'); // automatic evidence carries no entry of the tree
+  }, 60_000);
+
+  it('keeps the partial baseline of a walk stopped at the deadline, and stops supplied work', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const marker = join(at.scratch, 'walked');
+    // the shim resists only the walk: it emits one valid entry, says so, then blocks
+    const shim = join(at.scratch, 'blocking-python');
+    writeFileSync(
+      shim,
+      [
+        '#!/usr/bin/env python3',
+        'import json, os, runpy, sys, time',
+        "if sys.argv[1].endswith('snapshot-tree.py'):",
+        '    entry = {"type": "entry", "path": "notes.txt", "kind": "file",',
+        '             "size": "1", "mtimeNs": "2", "dev": "3", "ino": "4"}',
+        '    sys.stdout.write(json.dumps(entry) + "\\n")',
+        '    sys.stdout.flush()',
+        `    open(${JSON.stringify(marker)}, "w").close()`,
+        '    time.sleep(3600)',
+        'sys.argv = sys.argv[1:]',
+        'runpy.run_path(sys.argv[0], run_name="__main__")',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const ran: string[] = [];
+    let context: RunContext | undefined;
+
+    const result = await researchRun(configOf(at, { budgetMs: 8_000, cleanupReserveMs: 4_000 }), {
+      spawn: trackingSpawn,
+      python: shim,
+      after: (given) => (
+        (context = given),
+        [observing('observe', () => ran.push('observe'), at.control)]
+      ),
+    });
+
+    await untilReady('the walk to reach its barrier', () => existsSync(marker), 20_000);
+    expect(result.outcome).toMatchObject({ name: 'snapshot', status: 'refused' });
+    expect((result.outcome as { why: string }).why).toContain(
+      'the baseline snapshot is incomplete',
+    );
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'completed'],
+      ['snapshot', 'refused'],
+      ['observe', 'not_run'],
+    ]);
+    expect(ran).toEqual([]); // supplied work never ran behind a baseline that was not established
+    // the partial walk is still the baseline, inspected through the context the builder captured
+    const partial = context?.baseline();
+    expect(partial?.complete).toBe(false);
+    expect(partial?.entries.map((e) => e.path)).toEqual(['notes.txt']);
+    // and the lock went back despite the run stopping here
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+    // it does not resist the signal, so SIGTERM alone ended it; the exit says which
+    expect(tracked[2]?.kills).toEqual(['SIGTERM']);
+    expect(tracked[2]?.exit).toEqual({ code: null, signal: 'SIGTERM' });
+  }, 60_000);
+
+  it('observes the promise a thenable’s then returns, not only the thenable', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const unhandled: unknown[] = [];
+    const watch = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', watch);
+    try {
+      const result = await researchRun(configOf(at), {
+        spawn: trackingSpawn,
+        // adoption would call then and discard what it returned: that promise rejects on its own
+        after: {
+          async then() {
+            throw new Error('SENTINEL-SECRET from an async then');
+          },
+        } as never,
+      });
+      expect(result.outcome).toMatchObject({
+        status: 'refused',
+        why: 'the supplied phases could not be built',
+      });
+      expect(tracked).toEqual([]);
+      await sleepReal(100); // a turn in which an unobserved rejection would have surfaced
+      expect(unhandled).toEqual([]);
+      expect(JSON.stringify(result)).not.toContain('SENTINEL');
+    } finally {
+      process.off('unhandledRejection', watch);
+    }
   }, 60_000);
 });
