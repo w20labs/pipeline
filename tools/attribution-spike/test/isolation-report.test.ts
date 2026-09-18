@@ -37,7 +37,7 @@ const checked = (proceed: boolean, identities: Identity[]): Checked => ({
   outcomes: identities.map((identity) => ({ record, identity })),
 });
 const inputs = (over: Partial<IsolationInputs> = {}): IsolationInputs => ({
-  lock: { ok: true, lock: { path: '/cfg/.lock', token: 'secret-token' } },
+  lock: { ok: true, lock: { path: '/cfg/.lock' } }, // no token: the report never reads one
   records: checked(true, [{ kind: 'absent' }]),
   quiescence: quiescence(snap([]), snap([])),
   classification: classifyChanges(snap([]), snap([]), BINDING),

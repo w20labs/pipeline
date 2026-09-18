@@ -293,7 +293,7 @@ describe('rendering the whole report', () => {
   const report = (after: Snapshot) =>
     renderIsolationReport(
       isolationReport({
-        lock: { ok: true, lock: { path: '/cfg/.lock', token: 'secret-token' } },
+        lock: { ok: true, lock: { path: '/cfg/.lock' } }, // no token: the report never reads one
         records: {
           proceed: true,
           checked: 1,

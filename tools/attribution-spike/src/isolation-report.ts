@@ -1,6 +1,5 @@
 import type { ClassifiedRow, Classification, Quiescence } from './isolation.js';
 import type { Checked, Identity } from './process-identity.js';
-import type { Acquired } from './run-control.js';
 import type { SessionOwnership } from './session.js';
 import type { DifferenceRow } from './snapshot-diff.js';
 
@@ -12,8 +11,22 @@ import type { DifferenceRow } from './snapshot-diff.js';
  * runner's cleanup report, not here.
  */
 
+/**
+ * What the report needs of a lock attempt: where a held lock is, or why one was not held. Declared
+ * here rather than imported, so the report depends on the fields it renders and on nothing else.
+ */
+export type LockAttempt =
+  | { readonly ok: true; readonly lock: { readonly path: string } }
+  | {
+      readonly ok: false;
+      readonly why: string;
+      readonly cleanupDiagnostics?: readonly string[];
+      /** A partial lock an attempt created and could not confirm removing. */
+      readonly strandedLock?: string;
+    };
+
 export interface IsolationInputs {
-  readonly lock: Acquired;
+  readonly lock: LockAttempt;
   readonly records: Checked;
   readonly quiescence: Quiescence;
   readonly classification: Classification;

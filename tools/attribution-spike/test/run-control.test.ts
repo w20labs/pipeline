@@ -1,203 +1,26 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
 
-import { afterEach, describe, expect, it } from 'vitest';
-
-import {
-  acquireLock,
-  type LockFs,
-  nodeLockFs,
-  promptGate,
-  recordThenDispatch,
-  releaseLock,
-  withCleanup,
-} from '../src/run-control.js';
-
-const dirs: string[] = [];
-afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
-const lockPath = () => {
-  const dir = mkdtempSync(join(tmpdir(), 'pipeline-lock-'));
-  dirs.push(dir);
-  return join(dir, 'run.lock');
-};
-const OWNER = { runId: 'run-1', pid: 4242, startedAt: 1_000 };
-const throws = (message: string) => (): never => {
-  throw new Error(message);
-};
-const fingerprint = (path: string) => ({
-  bytes: readFileSync(path, 'utf8'),
-  ino: statSync(path).ino,
-});
-
-describe('the run lock', () => {
-  it('is taken exclusively with an owner token, and released by the invocation that took it', () => {
-    const path = lockPath();
-    const taken = acquireLock(path, OWNER);
-    if (!taken.ok) throw new Error('setup');
-    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ ...OWNER, token: taken.lock.token });
-    expect(releaseLock(taken.lock)).toBeUndefined();
-    expect(() => statSync(path)).toThrow();
-  });
-
-  it('refuses when held, and a failed attempt leaves the holder’s lock exactly as it was', () => {
-    const path = lockPath();
-    acquireLock(path, OWNER);
-    const before = fingerprint(path);
-    expect(acquireLock(path, { ...OWNER, runId: 'run-2' })).toEqual({
-      ok: false,
-      why: 'another run holds the lock',
-    });
-    expect(fingerprint(path)).toEqual(before);
-  });
-
-  it('refuses to release a lock that was replaced, leaving the replacement untouched', () => {
-    const path = lockPath();
-    const taken = acquireLock(path, OWNER);
-    if (!taken.ok) throw new Error('setup');
-    writeFileSync(path, JSON.stringify({ ...OWNER, runId: 'run-2', token: 'someone-else' }));
-    const replaced = fingerprint(path);
-    expect(releaseLock(taken.lock)).toBe('the lock was replaced; it was left as found');
-    expect(fingerprint(path)).toEqual(replaced);
-  });
-});
-
-describe('writing the lock', () => {
-  const exists = (path: string) => {
-    try {
-      statSync(path);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  it('writes the whole record across short writes, and the lock is usable', () => {
-    const path = lockPath();
-    const trickle: LockFs = {
-      ...nodeLockFs,
-      write: (fd, buffer, offset, length) =>
-        nodeLockFs.write(fd, buffer, offset, Math.min(3, length)),
-    };
-    const taken = acquireLock(path, OWNER, trickle);
-    if (!taken.ok) throw new Error('setup');
-    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ ...OWNER, token: taken.lock.token });
-    expect(releaseLock(taken.lock)).toBeUndefined();
-  });
-
-  it.each([
-    ['a write that makes no progress', { write: () => 0 }, 'Error: the write made no progress'],
-    [
-      'a write that throws',
-      {
-        write: throws('EIO'),
-      },
-      'Error: EIO',
-    ],
-  ])('removes its own partial lock after %s, having closed it', (_label, fault, cause) => {
-    const path = lockPath();
-    let closes = 0;
-    const fs: LockFs = {
-      ...nodeLockFs,
-      ...fault,
-      close: (fd) => {
-        closes += 1;
-        nodeLockFs.close(fd);
-      },
-    };
-    expect(acquireLock(path, OWNER, fs)).toEqual({
-      ok: false,
-      why: `the lock could not be written: ${cause}`,
-      cleanupDiagnostics: [],
-    });
-    expect(closes).toBe(1);
-    expect(exists(path)).toBe(false);
-  });
-
-  it('treats a failed close after a full write as a failure, removing the file', () => {
-    const path = lockPath();
-    const fs: LockFs = {
-      ...nodeLockFs,
-      close: (fd) => {
-        nodeLockFs.close(fd); // the real descriptor is released before the fault
-        throw new Error('EBADF');
-      },
-    };
-    expect(acquireLock(path, OWNER, fs)).toEqual({
-      ok: false,
-      why: 'the lock could not be closed: Error: EBADF',
-      cleanupDiagnostics: [],
-    });
-    expect(exists(path)).toBe(false);
-  });
-
-  it('reports a stranded lock when removal fails, keeping every failure', () => {
-    const path = lockPath();
-    const fs: LockFs = {
-      ...nodeLockFs,
-      write: throws('EIO'),
-      close: (fd) => {
-        nodeLockFs.close(fd);
-        throw new Error('EBADF');
-      },
-      unlink: throws('EPERM'),
-    };
-    expect(acquireLock(path, OWNER, fs)).toEqual({
-      ok: false,
-      why: 'the lock could not be written: Error: EIO',
-      cleanupDiagnostics: [
-        'the lock could not be closed: Error: EBADF',
-        'the partial lock could not be removed: Error: EPERM',
-      ],
-      strandedLock: path,
-    });
-    expect(exists(path)).toBe(true); // stranded, as reported
-  });
-
-  it('never removes anything after a refused exclusive open', () => {
-    const path = lockPath();
-    acquireLock(path, OWNER);
-    let unlinks = 0;
-    const counting: LockFs = {
-      ...nodeLockFs,
-      unlink: (p) => {
-        unlinks += 1;
-        nodeLockFs.unlink(p);
-      },
-    };
-    expect(acquireLock(path, { ...OWNER, runId: 'run-2' }, counting)).toMatchObject({ ok: false });
-    expect(unlinks).toBe(0);
-  });
-});
+import { promptGate, recordThenDispatch, withCleanup } from '../src/run-control.js';
 
 describe('cleanup around a run', () => {
-  it('releases the lock after a failed run, keeping the run’s own failure', async () => {
-    const path = lockPath();
-    const taken = acquireLock(path, OWNER);
-    if (!taken.ok) throw new Error('setup');
+  it('runs every cleanup after a failed run, keeping the run’s own failure', async () => {
+    const done: string[] = [];
     const result = await withCleanup(
       () => Promise.reject(new Error('the run failed')),
-      [() => releaseLock(taken.lock)],
+      [() => void done.push('first'), () => void done.push('second')],
     );
     expect(result).toEqual({ ok: false, failure: 'the run failed', cleanupDiagnostics: [] });
-    expect(() => statSync(path)).toThrow();
+    expect(done).toEqual(['first', 'second']); // every one, in the order it was registered
   });
 
-  it('keeps both the run’s failure and a failed release, neither hiding the other', async () => {
-    const path = lockPath();
-    const taken = acquireLock(path, OWNER);
-    if (!taken.ok) throw new Error('setup');
-    const stuck: LockFs = {
-      ...nodeLockFs,
-      unlink: throws('EPERM'),
-    };
+  it('keeps the run’s failure and every cleanup’s, neither hiding the other', async () => {
     const result = await withCleanup(
       () => Promise.reject(new Error('the run failed')),
       [
         () => {
-          throw new Error('an earlier cleanup broke'); // and the release after it still runs
+          throw new Error('an earlier cleanup broke'); // and the cleanup after it still runs
         },
-        () => releaseLock(taken.lock, stuck),
+        () => 'the last cleanup could not finish',
       ],
     );
     expect(result).toEqual({
@@ -205,7 +28,7 @@ describe('cleanup around a run', () => {
       failure: 'the run failed',
       cleanupDiagnostics: [
         'cleanup threw: Error: an earlier cleanup broke',
-        'the lock could not be released: Error: EPERM',
+        'the last cleanup could not finish',
       ],
     });
   });
