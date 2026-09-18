@@ -8,13 +8,16 @@ import {
   type AcquireOptions,
   type AcquireOutcome,
   LOCK_HELPER,
+  LOCK_KILL_GRACE_MS,
   LOCK_OUTPUT_BYTES,
+  LOCK_TERM_GRACE_MS,
   type LockDiagnostic,
   type LockHandle,
   type LockOwner,
   prepareAcquire,
   releaseLockBounded,
   type ReleaseOptions,
+  type ReleaseOutcome,
   type RandomSource,
 } from '../src/lock.js';
 
@@ -1039,6 +1042,257 @@ describe('taking the lock through the helper', () => {
         problems: ['reason is unknown'],
         mayRemain: true,
       });
+    });
+
+    describe('on controlled time', () => {
+      // restored even when an assertion throws, so a failure here cannot stop the clock for the rest
+      afterEach(() => vi.useRealTimers());
+      const T0 = 2_000_000;
+      const D = T0 + 10_000;
+      /**
+       * A clean acquisition on real time, then the clock taken over for the release itself. The
+       * release is started, not awaited: the caller advances time and reads what has settled.
+       */
+      const clocked = async (script: Script) => {
+        const handle = await acquired();
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        vi.setSystemTime(T0);
+        const helper = fakeHelper(script);
+        let outcome: ReleaseOutcome | undefined;
+        void releaseLockBounded(handle, {
+          deadline: D,
+          spawn: helper.spawn,
+          now: Date.now,
+        }).then((r) => (outcome = r));
+        return { handle, helper, settled: () => outcome };
+      };
+      /** What a later call reports, on real time, and whether it spawned anything. */
+      const again = async (handle: LockHandle) => {
+        vi.useRealTimers();
+        return release(handle);
+      };
+
+      it('gives up on a release that never ends, having asked it to stop', async () => {
+        const run = await clocked({ stdout: RELEASED, end: 'never' });
+        await vi.advanceTimersByTimeAsync(10_000 - 1);
+        expect(run.settled()).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(run.settled()).toEqual({
+          kind: 'unknown',
+          problems: ['ended early', 'signalled to stop'],
+          mayRemain: true,
+        });
+        expect(run.helper.signals).toEqual(['SIGTERM', 'SIGKILL']);
+      });
+
+      it('carves the lock’s own grace windows out of the release budget', async () => {
+        const run = await clocked({ stdout: RELEASED, end: 'never' });
+        const waiting = 10_000 - LOCK_TERM_GRACE_MS - LOCK_KILL_GRACE_MS;
+        await vi.advanceTimersByTimeAsync(waiting - 1);
+        expect(run.helper.signals).toEqual([]); // both graces come out of the one budget
+        await vi.advanceTimersByTimeAsync(1);
+        expect(run.helper.signals).toEqual(['SIGTERM']);
+        await vi.advanceTimersByTimeAsync(LOCK_TERM_GRACE_MS - 1);
+        expect(run.helper.signals).toEqual(['SIGTERM']);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(run.helper.signals).toEqual(['SIGTERM', 'SIGKILL']);
+      });
+
+      it('will not try again after a release that never ended', async () => {
+        const run = await clocked({ stdout: RELEASED, end: 'never' });
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(run.settled()?.kind).toBe('unknown');
+        const retry = await again(run.handle);
+        expect(retry.outcome).toEqual({
+          kind: 'not_attempted',
+          reason: 'unresolved',
+          mayRemain: true,
+        });
+        expect(retry.helper.argv).toEqual([]); // whether the lock is gone is still not established
+      });
+
+      it('gives up on a release that exited without closing its streams', async () => {
+        const run = await clocked({ stdout: RELEASED, end: 'exit-only' });
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(run.settled()).toEqual({
+          kind: 'unknown',
+          problems: ['ended early'],
+          mayRemain: true,
+        });
+        expect(run.helper.signals).toEqual([]); // it had already exited: nothing to stop
+        const retry = await again(run.handle);
+        expect(retry.outcome).toEqual({
+          kind: 'not_attempted',
+          reason: 'unresolved',
+          mayRemain: true,
+        });
+        expect(retry.helper.argv).toEqual([]);
+      });
+
+      it('is unchanged by anything the helper does after it settles', async () => {
+        const run = await clocked({ stdout: RELEASED, end: 'never' });
+        await vi.advanceTimersByTimeAsync(10_000);
+        const settled = structuredClone(run.settled());
+        const child = run.helper.children[0];
+        child?.stdout.emit('data', Buffer.from(RELEASED));
+        child?.emit('exit', 0, null);
+        child?.emit('close', 0, null);
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(run.settled()).toEqual(settled);
+        expect(Object.isFrozen(run.settled())).toBe(true);
+        // the private state, which a frozen outcome says nothing about, is still unresolved
+        const retry = await again(run.handle);
+        expect(retry.outcome).toEqual({
+          kind: 'not_attempted',
+          reason: 'unresolved',
+          mayRemain: true,
+        });
+        expect(retry.helper.argv).toEqual([]);
+      });
+
+      it('settles a clean release at once, and spends the one attempt', async () => {
+        const run = await clocked({ stdout: RELEASED });
+        await vi.advanceTimersByTimeAsync(0); // no part of it waits for the deadline
+        expect(run.settled()).toEqual({ kind: 'released', diagnostics: [] });
+        const retry = await again(run.handle);
+        expect(retry.outcome).toEqual({ kind: 'not_attempted', reason: 'already_attempted' });
+        expect(retry.helper.argv).toEqual([]);
+      });
+    });
+
+    it.each([
+      ['exits 1', { stdout: RELEASED, exit: 1 }, ['exited 1']],
+      [
+        'is killed',
+        { stdout: RELEASED, exit: null, signal: 'SIGSEGV' },
+        ['killed by SIGSEGV', 'exited null'],
+      ],
+      [
+        'is killed and complains',
+        { stdout: RELEASED, exit: null, signal: 'SIGSEGV', stderr: 'oh no\n' },
+        ['killed by SIGSEGV', 'exited null', 'wrote to stderr'],
+      ],
+      // a name that merely starts like a signal, and an exit code that merely starts like a number
+      [
+        'names an odd signal',
+        { stdout: RELEASED, exit: null, signal: 'SIGTERM extra' },
+        ['unrecognized', 'exited null'],
+      ],
+      [
+        'reports a lowercase signal',
+        { stdout: RELEASED, exit: null, signal: 'sigsegv' },
+        ['unrecognized', 'exited null'],
+      ],
+      ['exits with a fraction', { stdout: RELEASED, exit: 1.5 }, ['unrecognized']],
+      [
+        // cut short at the bound, so the run ended early and what it printed cannot be read
+        'overflows its output',
+        { stdout: 'x'.repeat(LOCK_OUTPUT_BYTES + 1) },
+        ['ended early', 'exceeded its output bound', 'the output is not exactly one line'],
+      ],
+      [
+        'never takes its input',
+        { stdout: RELEASED, refuseInput: true },
+        ['input delivery unconfirmed'],
+      ],
+    ] as [string, Script, string[]][])(
+      'sanitizes what it reports when a release %s',
+      async (_label, script, categories) => {
+        const handle = await acquired();
+        const { outcome } = await release(handle, script);
+        expect(outcome).toEqual({ kind: 'unknown', problems: categories, mayRemain: true });
+      },
+    );
+
+    it('reports unknown for a valid released line from an unclean run', async () => {
+      const handle = await acquired();
+      // the line says the lock is gone; the run does not support that, so nothing is established
+      const { outcome } = await release(handle, { stdout: RELEASED, exit: 1 });
+      expect(outcome).toEqual({ kind: 'unknown', problems: ['exited 1'], mayRemain: true });
+      const retry = await release(handle);
+      expect(retry.outcome).toEqual({
+        kind: 'not_attempted',
+        reason: 'unresolved',
+        mayRemain: true,
+      });
+      expect(retry.helper.argv).toEqual([]);
+    });
+
+    it('reports how the run ended before what it printed', async () => {
+      const handle = await acquired();
+      const { outcome } = await release(handle, {
+        stdout: line({ kind: 'freed', diagnostics: [] }),
+        exit: 1,
+      });
+      expect(outcome).toEqual({
+        kind: 'unknown',
+        problems: ['exited 1', 'kind is unknown'],
+        mayRemain: true,
+      });
+    });
+
+    it('keeps its secrets, and the helper’s words, out of every release outcome', async () => {
+      const SENTINEL = 'SENTINEL-OUTPUT';
+      const outcomes: ReleaseOutcome[] = [];
+      // a fresh acquisition per case: one handle allows one attempt
+      for (const script of [
+        { stdout: RELEASED },
+        { stdout: line({ kind: 'missing', diagnostics: [] }) },
+        {
+          stdout: line({ kind: 'not_ours', diagnostics: [{ step: 'close_lock', errno: 'EBADF' }] }),
+        },
+        { stdout: line({ kind: 'unrecognized', diagnostics: [] }) },
+        { stdout: line({ kind: 'replaced', diagnostics: [] }) },
+        { stdout: line({ kind: 'refused', reason: 'stat_failed', errno: 'EIO', diagnostics: [] }) },
+        { stdout: `${SENTINEL}\n` },
+        { stdout: RELEASED, stderr: `${SENTINEL}\n` },
+        { stdout: line({ kind: TOKEN, diagnostics: [] }) }, // the helper echoing the token back
+      ] as Script[])
+        outcomes.push((await release(await acquired(), script)).outcome);
+
+      const spent = await acquired();
+      outcomes.push((await release(spent, { stdout: RELEASED }, { deadline: Date.now() })).outcome);
+      outcomes.push((await release({ ...spent })).outcome);
+      const unclean = await acquired();
+      // an unconfirmed release, then the distinct refusal it leaves behind
+      outcomes.push((await release(unclean, { stdout: RELEASED, exit: 1 })).outcome);
+      outcomes.push((await release(unclean)).outcome);
+      const done = await acquired();
+      outcomes.push((await release(done)).outcome);
+      outcomes.push((await release(done)).outcome);
+
+      expect(outcomes.map((o) => (o.kind === 'not_attempted' ? o.reason : o.kind))).toEqual([
+        'released',
+        'missing',
+        'not_ours',
+        'unrecognized',
+        'replaced',
+        'refused',
+        'unknown',
+        'unknown',
+        'unknown',
+        'budget_spent',
+        'unknown_handle',
+        'unknown',
+        'unresolved',
+        'released',
+        'already_attempted',
+      ]);
+      for (const outcome of outcomes) {
+        const serialized = JSON.stringify(outcome) + JSON.stringify(Object.entries(outcome));
+        for (const secret of [TOKEN, NONCE, SENTINEL]) expect(serialized).not.toContain(secret);
+      }
+    });
+
+    it('keeps the record the helper was given out of the handle', async () => {
+      const handle = await acquired();
+      expect(Object.keys(handle)).toEqual(['controlDir', 'runId']);
+      expect(Object.isFrozen(handle)).toBe(true);
+      const reachable = JSON.stringify(handle) + JSON.stringify(Object.entries(handle));
+      for (const secret of [TOKEN, NONCE]) expect(reachable).not.toContain(secret);
+      // and a refusal naming the handle reports where and whose, never what it holds
+      const { outcome } = await release({ ...handle });
+      expect(outcome).toEqual({ kind: 'not_attempted', reason: 'unknown_handle' });
     });
 
     it('never repeats what a failed release said', async () => {
