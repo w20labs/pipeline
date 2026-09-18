@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -208,5 +209,87 @@ describe('the lock helper, run for real through the wrapper', () => {
     // bytes and inode both survive: the lock now in place was never this run's to remove
     expect(held(dir)).toEqual(theirs);
     expect(readdirSync(dir)).toEqual(['run.lock']);
+  }, 30_000);
+
+  /** Waits for a condition, bounded: the test never hangs on a barrier that was never reached. */
+  const until = async (ready: () => boolean, within: number) => {
+    const limit = Date.now() + within;
+    while (!ready()) {
+      if (Date.now() >= limit) throw new Error(`not reached within ${String(within)} ms`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+
+  it('cleans up after an acquisition that published and then hung', async () => {
+    const dir = control();
+    const base = join(dir, '..');
+    const marker = join(base, 'published');
+    // the barrier lives inside the helper process itself: os.link does the real link, says so, and
+    // then blocks — after publication, before the helper reports, with no second process involved
+    const shim = join(base, 'barrier-python');
+    writeFileSync(
+      shim,
+      [
+        '#!/usr/bin/env python3',
+        'import os, runpy, sys, time',
+        'real_link = os.link',
+        'def linked(*args, **kwargs):',
+        '    real_link(*args, **kwargs)',
+        `    open(${JSON.stringify(marker)}, "w").close()`,
+        '    time.sleep(3600)',
+        'os.link = linked',
+        // the helper checks these before it uses any flag: the stand-in must claim what link claims
+        'os.supports_dir_fd = set(os.supports_dir_fd) | {linked}',
+        'os.supports_follow_symlinks = set(os.supports_follow_symlinks) | {linked}',
+        'sys.argv = sys.argv[1:]',
+        'runpy.run_path(sys.argv[0], run_name="__main__")',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+
+    const running = take(dir, 'run-a', [TOKEN_A, NONCE_A], {
+      python: shim,
+      deadline: Date.now() + 3_000,
+    });
+    await until(() => existsSync(marker), 20_000); // publication reached: only now is a timeout evidence
+    const outcome = await running;
+
+    expect(outcome).toEqual({
+      kind: 'unknown',
+      handle: { controlDir: dir, runId: 'run-a' },
+      problems: [
+        'killed by SIGTERM',
+        'exited null',
+        'signalled to stop',
+        'the output is not exactly one line',
+      ],
+    });
+    // the helper's own exit, observed independently of what the wrapper reported
+    expect(tracked).toHaveLength(1);
+    expect(tracked[0]?.exit).toEqual({ code: null, signal: 'SIGTERM' });
+    expect(tracked[0]?.kills).toEqual(['SIGTERM']); // SIGTERM ended it; no escalation was needed
+
+    // the lock is published and this run's temporary file is still there: the barrier held before both
+    expect(JSON.parse(readFileSync(join(dir, 'run.lock'), 'utf8'))).toMatchObject({
+      runId: 'run-a',
+      token: TOKEN_A,
+    });
+    expect(readdirSync(dir).sort()).toEqual([`run.lock`, `run.lock.tmp-${NONCE_A}`]);
+
+    if (outcome.kind !== 'unknown') throw new Error(outcome.kind);
+    // its exit was confirmed, so this acquisition is eligible: release-if-ours removes both
+    expect(await give(outcome.handle)).toEqual({ kind: 'released', diagnostics: [] });
+    expect(readdirSync(dir)).toEqual([]);
+    expect(tracked).toHaveLength(2);
+    expect([tracked[1]?.exit?.code, tracked[1]?.kills]).toEqual([0, []]);
+  }, 40_000);
+
+  it('spawns nothing once the budget is spent, and leaves the directory alone', async () => {
+    const dir = control();
+    const outcome = await take(dir, 'run-a', [TOKEN_A, NONCE_A], { deadline: Date.now() - 1 });
+    expect(outcome.kind).toBe('unknown');
+    expect(tracked).toEqual([]); // no child was started, so there is nothing to account for
+    expect(readdirSync(dir)).toEqual([]);
   }, 30_000);
 });
