@@ -11,7 +11,7 @@
  */
 import type { spawn as nodeSpawn } from 'node:child_process';
 
-import { lockPhase } from './lock-phase.js';
+import { type LockDeps, lockPhase } from './lock-phase.js';
 import type { LockOwner } from './lock.js';
 import {
   nodeRunnerFs,
@@ -29,6 +29,12 @@ export interface ResearchRunOptions {
   readonly after?: readonly Phase[];
   readonly python?: string;
   readonly spawn?: typeof nodeSpawn;
+  /**
+   * Dependency injection for the lock wrappers: whatever is given here is used in their place, so
+   * a caller can replace acquisition or release outright. Tests wrap the real ones by choice; that
+   * is their decision, not a guarantee this seam makes.
+   */
+  readonly lock?: Pick<LockDeps, 'acquire' | 'release'>;
   readonly fs?: RunnerFs;
   readonly now?: () => number;
 }
@@ -78,6 +84,10 @@ export const researchRun = async (
   const now = options.now ?? Date.now;
   const python = options.python;
   const spawn = options.spawn;
+  // read once, both functions captured: replacing either afterwards reaches no run already under way
+  const injected = options.lock;
+  const acquire = injected?.acquire;
+  const release = injected?.release;
 
   if (after.some((p) => p.name === LOCK))
     return refusedBeforeStart(
@@ -96,6 +106,8 @@ export const researchRun = async (
       now,
       ...(python === undefined ? {} : { python }),
       ...(spawn === undefined ? {} : { spawn }),
+      ...(acquire === undefined ? {} : { acquire }),
+      ...(release === undefined ? {} : { release }),
     },
   );
   return runResearch(c, [lock, ...after], fs, now);

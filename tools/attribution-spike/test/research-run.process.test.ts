@@ -12,8 +12,10 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { acquireLockBounded, releaseLockBounded } from '../src/lock.js';
+import type { LockDeps } from '../src/lock-phase.js';
 import { researchRun } from '../src/research-run.js';
 import type { Phase, RunConfig, RunnerFs, RunResult } from '../src/runner.js';
 
@@ -26,7 +28,46 @@ interface Tracked {
   error?: Error;
 }
 let tracked: Tracked[] = [];
-let dirs: string[] = [];
+let dirs: { readonly path: string; why?: string }[] = [];
+/** Kept, not deleted: work that could still use this path was never confirmed settled. */
+const retain = (path: string, why: string) => {
+  const entry = dirs.find((d) => d.path === path);
+  if (entry !== undefined) entry.why = why;
+};
+/**
+ * Removes what nothing can be using and keeps what was retained, reporting every kept path. Called
+ * only once the tracked children are known to have ended.
+ */
+const disposeOf = (entries: readonly { path: string; why?: string }[]): string[] => {
+  const kept: string[] = [];
+  for (const entry of entries) {
+    if (entry.why === undefined) rmSync(entry.path, { recursive: true, force: true });
+    else kept.push(`retained ${entry.path}: ${entry.why}`);
+  }
+  return kept;
+};
+const realSetTimeout = setTimeout; // captured before any test fakes timers
+const sleepReal = (ms: number) => new Promise((resolve) => realSetTimeout(resolve, ms));
+/**
+ * Bounded by its own counted sleeps rather than a clock, so a faked `Date` cannot stall it, and it
+ * names what was missing instead of spinning. It checks a predicate: it knows nothing about why.
+ */
+const untilReady = async (what: string, ready: () => boolean, within = 10_000) => {
+  for (let waited = 0; waited < within; waited += 20) {
+    if (ready()) return;
+    await sleepReal(20);
+  }
+  throw new Error(`not ready within ${String(within)} ms: ${what}`);
+};
+/** Watches a promise from the moment it exists, so no later await can meet an unobserved rejection. */
+const observed = <T>(work: Promise<T>) => {
+  const state = { done: false, error: undefined as unknown };
+  void work.then(
+    () => (state.done = true),
+    (error: unknown) => ((state.error = error), (state.done = true)),
+  );
+  return { work, state };
+};
 
 const trackingSpawn = ((command: string, args: string[], options: object) => {
   const child = spawn(command, args, options);
@@ -59,21 +100,23 @@ afterEach(async () => {
   // a directory goes only once every process that could still be using it is known to have ended
   if (unconfirmed.length > 0)
     throw new Error(
-      `termination unconfirmed; kept ${created.join(', ')}: ${unconfirmed.join('; ')}`,
+      `termination unconfirmed; kept ${created.map((d) => d.path).join(', ')}: ${unconfirmed.join('; ')}`,
     );
-  for (const dir of created) rmSync(dir, { recursive: true, force: true });
+  const kept = disposeOf(created); // only now: every child that could use these has ended
+  if (kept.length > 0) throw new Error(kept.join('; '));
 }, 30_000);
 
 /** Separate directories for every path the configuration keeps apart. */
 const workspace = () => {
   const base = mkdtempSync(join(tmpdir(), 'pipeline-research-run-'));
-  dirs.push(base);
-  const at: Record<string, string> = {};
+  dirs.push({ path: base });
+  const at: Record<string, string> = { base };
   for (const name of ['runs', 'control', 'research', 'operator', 'scratch']) {
     at[name] = join(base, name);
     mkdirSync(at[name] as string);
   }
   return at as {
+    base: string;
     runs: string;
     control: string;
     research: string;
@@ -430,4 +473,416 @@ describe('a composed run', () => {
     expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0]); // acquisition and release both ran
     expect(readdirSync(at.control)).toEqual([]);
   }, 60_000);
+
+  it('cleans up after an acquisition that published and then hung', async () => {
+    const at = workspace();
+    const marker = join(at.scratch, 'published');
+    // the barrier is inside the helper process: os.link does the real link, says so, then blocks
+    const shim = join(at.scratch, 'barrier-python');
+    writeFileSync(
+      shim,
+      [
+        '#!/usr/bin/env python3',
+        'import os, runpy, sys, time',
+        'real_link = os.link',
+        'def linked(*args, **kwargs):',
+        '    real_link(*args, **kwargs)',
+        `    open(${JSON.stringify(marker)}, "w").close()`,
+        '    time.sleep(3600)',
+        'os.link = linked',
+        'os.supports_dir_fd = set(os.supports_dir_fd) | {linked}',
+        'os.supports_follow_symlinks = set(os.supports_follow_symlinks) | {linked}',
+        'sys.argv = sys.argv[1:]',
+        'runpy.run_path(sys.argv[0], run_name="__main__")',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+
+    const result = await researchRun(configOf(at, { budgetMs: 6_000, cleanupReserveMs: 3_000 }), {
+      spawn: trackingSpawn,
+      python: shim,
+    });
+
+    expect(existsSync(marker)).toBe(true); // publication was reached before the helper was stopped
+    expect(result.outcome).toMatchObject({ name: 'lock', status: 'refused' });
+    const why = (result.outcome as { why: string }).why;
+    expect(why).toContain('whether the lock was taken is not established');
+    expect(why).toContain('the lock may remain');
+    // its exit was confirmed, so the acquisition is eligible: cleanup takes the lock back
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual([]);
+    expect(tracked).toHaveLength(2); // the barriered acquisition, then the release
+    expect(tracked[0]?.kills).toEqual(['SIGTERM']);
+    expect(tracked[1]?.exit?.code).toBe(0);
+  }, 60_000);
+
+  it('uses the lock functions it captured, not ones swapped in mid-run', async () => {
+    const at = workspace();
+    const swapped: string[] = [];
+    const used: string[] = [];
+    const creating = deferred<void>();
+    const release = deferred<void>();
+    const lock: Mutable<Pick<LockDeps, 'acquire' | 'release'>> = {
+      acquire: async (dir, owner, options) => (
+        used.push('acquire'),
+        acquireLockBounded(dir, owner, options)
+      ),
+      release: async (handle, options) => (
+        used.push('release'),
+        releaseLockBounded(handle, options)
+      ),
+    };
+
+    const run = researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      lock,
+      fs: {
+        mkdirExclusive: async (path) => {
+          creating.resolve();
+          await release.promise;
+          mkdirSync(path);
+        },
+        writeSummary: async (path, text) => writeFileSync(path, text, { flag: 'wx' }),
+      },
+    });
+    await creating.promise;
+    lock.acquire = async () => (
+      swapped.push('acquire'),
+      { kind: 'not_attempted', reason: 'invalid_request' }
+    );
+    lock.release = async () => (swapped.push('release'), { kind: 'missing', diagnostics: [] });
+    release.resolve();
+    const result = await run;
+
+    expect(swapped).toEqual([]); // neither replacement was reached
+    expect(used).toEqual(['acquire', 'release']); // both captured functions were
+    expect(result.outcome).toEqual({ kind: 'completed' });
+    expect(readdirSync(at.control)).toEqual([]);
+  }, 60_000);
+
+  /**
+   * Wraps an acquisition — the genuine one by default — and withholds its result until the test
+   * opens the gate. A failure is recorded and both waits are released, so nothing can hang on it.
+   */
+  const withheld = (inner: LockDeps['acquire'] = acquireLockBounded) => {
+    const gate = deferred<void>();
+    const arrived = deferred<void>();
+    const state = { invoked: false, arrived: false, settled: false, failure: undefined as unknown };
+    const acquire: LockDeps['acquire'] = async (dir, owner, options) => {
+      state.invoked = true;
+      let outcome: Awaited<ReturnType<LockDeps['acquire'] & object>>;
+      try {
+        outcome = await inner(dir, owner, options);
+      } catch (cause) {
+        state.failure = cause;
+        state.arrived = true;
+        state.settled = true;
+        arrived.resolve();
+        throw cause;
+      }
+      state.arrived = true;
+      arrived.resolve();
+      await gate.promise;
+      state.settled = true;
+      return outcome;
+    };
+    return { acquire, gate, state, acquired: arrived.promise };
+  };
+
+  type Withheld = ReturnType<typeof withheld>;
+  /** Bounded, and answers rather than throws: both settlement states are checked either way. */
+  const confirmed = async (what: string, done: () => boolean) => {
+    try {
+      await untilReady(what, done, 5_000);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * Opens the gate and waits, bounded, for the withheld acquisition and for the run. Both states
+   * are checked even when the first cannot be confirmed, and whatever is left unsettled keeps its
+   * workspace: the registry entry is marked, never removed, so teardown still reaps its children.
+   */
+  const settleWithheld = async (w: Withheld, run: { state: { done: boolean } }, base: string) => {
+    vi.useRealTimers();
+    w.gate.resolve();
+    const ranOut = await confirmed('the composed run', () => run.state.done);
+    // an acquisition that was never invoked is outstanding until the run itself has settled: one
+    // still inside directory creation could yet start it
+    const acquisitionOut = w.state.invoked
+      ? await confirmed('the withheld acquisition', () => w.state.settled)
+      : ranOut;
+    const outstanding: string[] = [];
+    if (!acquisitionOut)
+      outstanding.push(
+        w.state.invoked ? 'the withheld acquisition did not settle' : 'the run could still acquire',
+      );
+    if (!ranOut) outstanding.push('the composed run did not settle');
+    if (outstanding.length > 0) retain(base, outstanding.join('; '));
+    return outstanding;
+  };
+
+  it('reconciles an acquisition delivered during the cleanup reserve', async () => {
+    const at = workspace();
+    const w = withheld();
+    // the phase deadline falls at +2 s, the run deadline at +6 s: delivery lands inside the reserve
+    const run = observed(
+      researchRun(configOf(at, { budgetMs: 6_000, cleanupReserveMs: 4_000 }), {
+        spawn: trackingSpawn,
+        lock: { acquire: w.acquire },
+      }),
+    );
+    try {
+      await untilReady('the acquisition to arrive', () => w.state.arrived, 15_000);
+      await sleepReal(3_000); // past the phase deadline, inside the reserve
+      w.gate.resolve();
+      await untilReady('the composed run', () => run.state.done, 15_000);
+      const result = await run.work;
+
+      expect(result.phases.map((p) => p.status)).toEqual(['timed_out']);
+      expect(result.cleanupDiagnostics).toEqual([]); // reconciled, then released
+      expect(readdirSync(at.control)).toEqual([]);
+      expect(tracked).toHaveLength(2);
+    } finally {
+      expect(await settleWithheld(w, run, at.base)).toEqual([]);
+    }
+  }, 60_000);
+
+  it('spawns no release for an acquisition still withheld at the cleanup deadline', async () => {
+    const at = workspace();
+    const w = withheld();
+    const BUDGET = 4_000;
+    const RESERVE = 2_000;
+    const origin = 1_000_000; // one captured origin: every deadline below derives from it
+    const clock = { t: origin };
+    const run = observed(
+      researchRun(configOf(at, { budgetMs: BUDGET, cleanupReserveMs: RESERVE }), {
+        spawn: trackingSpawn,
+        now: () => clock.t,
+        lock: { acquire: w.acquire },
+      }),
+    );
+
+    try {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      // bounded on observed state, by real sleeps: fake timers cannot stall it, and a run that
+      // refused before acquisition cannot leave this suspended
+      await untilReady('the acquisition to arrive', () => w.state.arrived, 15_000);
+
+      // to the phase deadline, clock and timers moved together, so the runner gives up on run()
+      clock.t = origin + BUDGET - RESERVE;
+      await vi.advanceTimersByTimeAsync(BUDGET - RESERVE);
+      // cleanup runs synchronously before `until` is entered, so reconcile registers its timer
+      // first; both delays come from this same clock, so they are equal. Two registered timers is
+      // the signal that both exist — never elapsed real time, and bounded so a miss cannot spin.
+      await untilReady('both cleanup timers registered', () => vi.getTimerCount() >= 2, 10_000);
+
+      // to the cleanup deadline exactly: `now() > deadline` is false there, so the phase's own
+      // result is accepted rather than discarded as late
+      clock.t = origin + BUDGET;
+      await vi.advanceTimersByTimeAsync(RESERVE);
+      await untilReady('the composed run', () => run.state.done, 15_000);
+      const result = await run.work;
+
+      expect(result.cleanupDiagnostics).toEqual([
+        'lock: the acquisition did not resolve by the cleanup deadline; the lock may remain',
+      ]);
+      expect(tracked).toHaveLength(1); // nothing was released: the handle was never known
+      expect(JSON.parse(readFileSync(join(at.control, 'run.lock'), 'utf8'))).toMatchObject({
+        runId: 'run-1',
+      });
+    } finally {
+      expect(await settleWithheld(w, run, at.base)).toEqual([]);
+      await sleepReal(100); // a turn of real time: a late release would have been recorded by now
+      expect(tracked).toHaveLength(1); // late settlement starts nothing
+      rmSync(join(at.control, 'run.lock'), { force: true });
+    }
+  }, 60_000);
+
+  it('reads the supplied phase list once', async () => {
+    const at = workspace();
+    const reads: string[] = [];
+    const ran: string[] = [];
+    const impostor = observing('lock', () => ran.push('impostor'), at.control);
+    const options = { spawn: trackingSpawn };
+    Object.defineProperty(options, 'after', {
+      get: () => (reads.push('read'), reads.length === 1 ? [] : [impostor]),
+      enumerable: true,
+    });
+
+    const result = await researchRun(configOf(at), options);
+    expect(reads).toHaveLength(1); // one read, and the composition is built from it
+    expect(status(result)).toEqual([['lock', 'completed']]);
+    expect(ran).toEqual([]);
+  }, 60_000);
+
+  it('gives up on a readiness condition that never holds, and says what was missing', async () => {
+    // the helper only, with a predicate that cannot become true: nothing here reproduces a runner
+    // state, and the bound is what stops an unmet condition from spinning past a test timeout
+    const started = Date.now();
+    await expect(untilReady('two cleanup timers', () => false, 200)).rejects.toThrow(
+      'not ready within 200 ms: two cleanup timers',
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('keeps a workspace whose withheld work cannot be confirmed settled', async () => {
+    const at = workspace();
+    const never = deferred<void>();
+    // fabricated unsettled state, driven through the real teardown: the acquisition never settles
+    const w = withheld(() => never.promise as never);
+    const run = observed(new Promise<string>(() => undefined)); // never settles either
+    // invoked, so the acquisition itself is the outstanding work, not a run that might yet start one
+    const attempt = observed(
+      w.acquire(
+        at.control,
+        { runId: 'run-1', pid: 1, startedAt: '2026-09-17T08:30:00Z' },
+        {
+          deadline: Date.now() + 1_000,
+        },
+      ),
+    );
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+
+    const outstanding = await settleWithheld(w, run, at.base);
+
+    // both are checked: failing to confirm the first never skips the second
+    expect(outstanding).toEqual([
+      'the withheld acquisition did not settle',
+      'the composed run did not settle',
+    ]);
+    expect(vi.isFakeTimers()).toBe(false); // real timers restored by the teardown itself
+    expect(dirs.find((d) => d.path === at.base)?.why).toBe(
+      'the withheld acquisition did not settle; the composed run did not settle',
+    );
+    expect(existsSync(at.control)).toBe(true); // a real directory, kept rather than deleted
+
+    // nothing can be using it now: this fixture disposes of itself and clears its own mark
+    never.resolve();
+    await untilReady('the fabricated acquisition', () => attempt.state.done, 5_000);
+    const entry = dirs.find((d) => d.path === at.base);
+    if (entry !== undefined) delete entry.why;
+    rmSync(at.base, { recursive: true, force: true });
+  }, 30_000);
+
+  it('records an acquisition that fails instead of leaving its waiters pending', async () => {
+    const failing = withheld(() => {
+      throw new Error('spawn SENTINEL-SECRET ENOENT');
+    });
+    const attempt = observed(
+      failing.acquire(
+        '/cache/control',
+        { runId: 'run-1', pid: 1, startedAt: '2026-09-17T08:30:00Z' },
+        {
+          deadline: Date.now() + 1_000,
+        },
+      ),
+    );
+
+    // resolved by the failure, so no waiter is left pending — and bounded even if it were not
+    await untilReady('the failed acquisition to arrive', () => failing.state.arrived, 5_000);
+    await untilReady('the failed acquisition', () => attempt.state.done, 5_000);
+    expect(failing.state.settled).toBe(true);
+    expect(String(failing.state.failure)).toContain('ENOENT');
+    expect(attempt.state.error).toBe(failing.state.failure);
+  }, 30_000);
+
+  it('keeps a workspace when a run that has not acquired yet cannot be confirmed settled', async () => {
+    const at = workspace();
+    const w = withheld(); // never invoked: the run is still somewhere before acquisition
+    const run = observed(new Promise<string>(() => undefined));
+    try {
+      const outstanding = await settleWithheld(w, run, at.base);
+      // not invoked is not proof of nothing outstanding while the run could still start one
+      expect(outstanding).toEqual([
+        'the run could still acquire',
+        'the composed run did not settle',
+      ]);
+      expect(dirs.find((d) => d.path === at.base)?.why).toContain('could still acquire');
+      expect(existsSync(at.control)).toBe(true);
+    } finally {
+      const entry = dirs.find((d) => d.path === at.base);
+      if (entry !== undefined) delete entry.why; // nothing here ever started work on this path
+      rmSync(at.base, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('reaches teardown when startup refuses before acquisition', async () => {
+    const at = workspace();
+    const w = withheld();
+    const run = observed(
+      researchRun(configOf(at), {
+        spawn: trackingSpawn,
+        lock: { acquire: w.acquire },
+        fs: {
+          mkdirExclusive: () => Promise.reject(new Error('EACCES')),
+          writeSummary: async (path, text) => writeFileSync(path, text, { flag: 'wx' }),
+        },
+      }),
+    );
+    try {
+      await untilReady('the refused run', () => run.state.done, 15_000);
+      const result = await run.work;
+      expect(result.outcome).toMatchObject({ name: 'start', status: 'refused' });
+      expect((result.outcome as { why: string }).why).toContain(
+        'the run directory could not be created',
+      );
+      expect(w.state.invoked).toBe(false); // acquisition was never reached
+      expect(tracked).toEqual([]);
+    } finally {
+      // the run settled, so a never-invoked acquisition leaves nothing outstanding
+      expect(await settleWithheld(w, run, at.base)).toEqual([]);
+    }
+  }, 30_000);
+
+  it('disposes of what is finished and keeps what is retained, naming it', () => {
+    const gone = mkdtempSync(join(tmpdir(), 'pipeline-dispose-gone-'));
+    const kept = mkdtempSync(join(tmpdir(), 'pipeline-dispose-kept-'));
+    try {
+      const report = disposeOf([
+        { path: gone },
+        { path: kept, why: 'a helper may still be there' },
+      ]);
+      expect(existsSync(gone)).toBe(false); // nothing could be using it
+      expect(existsSync(kept)).toBe(true); // something might
+      expect(report).toEqual([`retained ${kept}: a helper may still be there`]);
+    } finally {
+      for (const dir of [gone, kept]) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a workspace whose acquisition is unsettled even though the run finished', async () => {
+    const at = workspace();
+    const never = deferred<void>();
+    const w = withheld(() => never.promise as never);
+    const run = observed(Promise.resolve('the runner gave up and returned')); // settled
+    const attempt = observed(
+      w.acquire(
+        at.control,
+        { runId: 'run-1', pid: 1, startedAt: '2026-09-17T08:30:00Z' },
+        {
+          deadline: Date.now() + 1_000,
+        },
+      ),
+    );
+
+    try {
+      // a settled runner says nothing about the acquisition it abandoned: that is checked on its own
+      expect(await settleWithheld(w, run, at.base)).toEqual([
+        'the withheld acquisition did not settle',
+      ]);
+      expect(dirs.find((d) => d.path === at.base)?.why).toBe(
+        'the withheld acquisition did not settle',
+      );
+      expect(existsSync(at.control)).toBe(true); // registered, marked, and still there
+    } finally {
+      never.resolve();
+      await untilReady('the fabricated acquisition', () => attempt.state.done, 5_000);
+      const entry = dirs.find((d) => d.path === at.base);
+      if (entry !== undefined) delete entry.why; // only now: its work is known to have ended
+      rmSync(at.base, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
