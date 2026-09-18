@@ -17,6 +17,7 @@ import {
   type ReleaseOutcome,
 } from './lock.js';
 import type { Phase, PhaseResult } from './runner.js';
+import type { spawn as nodeSpawn } from 'node:child_process';
 
 export interface LockLocations {
   readonly controlDir: string;
@@ -28,6 +29,9 @@ export interface LockDeps {
   readonly acquire?: typeof acquireLockBounded;
   readonly release?: typeof releaseLockBounded;
   readonly now?: () => number;
+  /** Passed through to both wrappers, so a real run can name its interpreter and watch its children. */
+  readonly python?: string;
+  readonly spawn?: typeof nodeSpawn;
 }
 
 /** A diagnostic as one fixed token: the step and errno the wrapper already checked. */
@@ -145,6 +149,13 @@ export const lockPhase = (locations: LockLocations, deps: LockDeps = {}): Phase 
   const acquire = deps.acquire ?? acquireLockBounded;
   const release = deps.release ?? releaseLockBounded;
   const now = deps.now ?? Date.now;
+  // copied with the rest: a caller cannot change which interpreter runs after the phase is made.
+  // The clock goes with them, so the wrappers measure the deadline the runner computed.
+  const bounds = Object.freeze({
+    now,
+    ...(deps.python === undefined ? {} : { python: deps.python }),
+    ...(deps.spawn === undefined ? {} : { spawn: deps.spawn }),
+  });
   /** Stored before anything is awaited, so cleanup can reconcile an acquisition still in flight. */
   let attempt: Promise<Attempt> | undefined;
   let used = false;
@@ -155,7 +166,7 @@ export const lockPhase = (locations: LockLocations, deps: LockDeps = {}): Phase 
       if (used) return refused('the lock phase was already used by this run');
       used = true;
       // guarded before it is called: a synchronous throw would otherwise carry its own words out
-      const started = guarded(() => acquire(controlDir, owner, { deadline }));
+      const started = guarded(() => acquire(controlDir, owner, { deadline, ...bounds }));
       attempt = started;
       const outcome = await started;
       return outcome === FAILED ? refused(FAILED_WHY) : reportAcquire(outcome);
@@ -170,7 +181,7 @@ export const lockPhase = (locations: LockLocations, deps: LockDeps = {}): Phase 
       if (outcome.kind === 'not_attempted') return undefined; // nothing was spawned
       // reconciling spends time, so the budget is rechecked before a release is started
       if (now() >= deadline) return `the cleanup budget was spent before release; ${MAY_REMAIN}`;
-      const given = await guarded(() => release(outcome.handle, { deadline }));
+      const given = await guarded(() => release(outcome.handle, { deadline, ...bounds }));
       return given === FAILED
         ? `the lock could not be given back; ${MAY_REMAIN}`
         : reportRelease(given);
