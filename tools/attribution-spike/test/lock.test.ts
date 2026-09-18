@@ -9,8 +9,11 @@ import {
   type AcquireOutcome,
   LOCK_HELPER,
   LOCK_OUTPUT_BYTES,
+  type LockHandle,
   type LockOwner,
   prepareAcquire,
+  releaseLockBounded,
+  type ReleaseOptions,
   type RandomSource,
 } from '../src/lock.js';
 
@@ -588,5 +591,230 @@ describe('taking the lock through the helper', () => {
     );
     expect(outcome).toEqual({ kind: 'not_attempted', reason: 'invalid_request' });
     expect(helper.argv).toEqual([]);
+  });
+
+  describe('and giving it back', () => {
+    const RELEASED = line({ kind: 'released', diagnostics: [] });
+    /** An acquisition through a fake helper, ending as scripted, and the handle it produced. */
+    const acquired = async (
+      script: Script = { stdout: ACQUIRED },
+      over: Partial<AcquireOptions> = {},
+    ) => {
+      const { outcome } = await take(script, over);
+      const handle = 'handle' in outcome ? outcome.handle : undefined;
+      if (handle === undefined) throw new Error(`no handle: ${outcome.kind}`);
+      return handle;
+    };
+    const release = async (
+      handle: LockHandle,
+      script: Script = { stdout: RELEASED },
+      over: Partial<ReleaseOptions> = {},
+    ) => {
+      const helper = fakeHelper(script);
+      const outcome = await releaseLockBounded(handle, {
+        deadline: Date.now() + 10_000,
+        spawn: helper.spawn,
+        ...over,
+      });
+      return { outcome, helper };
+    };
+
+    it('asks the helper to release, sending back the record it was given', async () => {
+      const handle = await acquired();
+      const { outcome, helper } = await release(handle);
+      expect(helper.argv).toEqual([[LOCK_HELPER, '--dir', DIR, '--mode', 'release']]);
+      expect(JSON.parse(helper.written[0] ?? '')).toEqual({ ...OWNER, token: TOKEN, nonce: NONCE });
+      expect(outcome).toEqual({ kind: 'released', diagnostics: [] });
+    });
+
+    it('releases each acquisition with its own secrets', async () => {
+      const first = await acquired();
+      const second = await (async () => {
+        const helper = fakeHelper({ stdout: ACQUIRED });
+        const outcome = await acquireLockBounded(
+          DIR,
+          { ...OWNER, runId: 'run-2' },
+          {
+            deadline: Date.now() + 10_000,
+            spawn: helper.spawn,
+            random: fixed('c'.repeat(32), 'd'.repeat(32)).random,
+          },
+        );
+        if (outcome.kind !== 'acquired') throw new Error(outcome.kind);
+        return outcome.handle;
+      })();
+      const one = await release(first);
+      const two = await release(second);
+      expect(JSON.parse(one.helper.written[0] ?? '')).toMatchObject({
+        runId: 'run-1',
+        token: TOKEN,
+        nonce: NONCE,
+      });
+      expect(JSON.parse(two.helper.written[0] ?? '')).toMatchObject({
+        runId: 'run-2',
+        token: 'c'.repeat(32),
+        nonce: 'd'.repeat(32),
+      });
+      expect(two.helper.written[0]).not.toContain(TOKEN); // never the other acquisition's secrets
+    });
+
+    it('releases after an acquisition whose helper exited without closing', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      vi.setSystemTime(1_000_000);
+      const helper = fakeHelper({ stdout: ACQUIRED, end: 'exit-only' });
+      let acquisition: AcquireOutcome | undefined;
+      void acquireLockBounded(DIR, OWNER, {
+        deadline: 1_010_000,
+        spawn: helper.spawn,
+        now: Date.now,
+        random: fixed(TOKEN, NONCE).random,
+      }).then((r) => (acquisition = r));
+      await vi.advanceTimersByTimeAsync(10_000);
+      vi.useRealTimers();
+      if (acquisition?.kind !== 'unknown') throw new Error(String(acquisition?.kind));
+      // it was seen to end, so the lock it may have published can be cleaned up
+      const { outcome, helper: releaseHelper } = await release(acquisition.handle);
+      expect(outcome).toEqual({ kind: 'released', diagnostics: [] });
+      expect(releaseHelper.argv).toHaveLength(1);
+    });
+
+    it('keeps a cleanup diagnostic from a release that succeeded', async () => {
+      const handle = await acquired();
+      // the helper's own release path reports this when its leftover was no longer the file it read
+      const replaced = { step: 'temp_replaced', errno: null };
+      const { outcome } = await release(handle, {
+        stdout: line({ kind: 'released', diagnostics: [replaced] }),
+      });
+      expect(outcome).toEqual({ kind: 'released', diagnostics: [replaced] });
+      // a diagnostic is not a problem: the lock is gone, and the one attempt is spent
+      expect((await release(handle)).outcome).toEqual({
+        kind: 'not_attempted',
+        reason: 'already_attempted',
+      });
+    });
+
+    it('will not release after an acquisition whose helper never ran', async () => {
+      const throwing = (() => {
+        throw new Error('spawn python3 ENOENT');
+      }) as unknown as typeof spawn;
+      const outcome = await acquireLockBounded(DIR, OWNER, {
+        deadline: Date.now() + 10_000,
+        spawn: throwing,
+        random: fixed(TOKEN, NONCE).random,
+      });
+      if (outcome.kind !== 'unknown') throw new Error(outcome.kind);
+      const { outcome: released, helper } = await release(outcome.handle);
+      expect(released).toEqual({ kind: 'not_attempted', reason: 'never_ran' });
+      expect(helper.argv).toEqual([]); // nothing was published, so there is nothing to release
+    });
+
+    it('will not release after an acquisition that never terminated', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      vi.setSystemTime(1_000_000);
+      const helper = fakeHelper({ stdout: ACQUIRED, end: 'never' });
+      let acquisition: AcquireOutcome | undefined;
+      void acquireLockBounded(DIR, OWNER, {
+        deadline: 1_010_000,
+        spawn: helper.spawn,
+        now: Date.now,
+        random: fixed(TOKEN, NONCE).random,
+      }).then((r) => (acquisition = r));
+      await vi.advanceTimersByTimeAsync(10_000);
+      vi.useRealTimers();
+      if (acquisition?.kind !== 'unknown') throw new Error(String(acquisition?.kind));
+      // its own report, kept apart from a spent budget: the helper and the lock are both unresolved
+      const { outcome, helper: releaseHelper } = await release(
+        acquisition.handle,
+        { stdout: RELEASED },
+        { deadline: Date.now() - 1 },
+      );
+      expect(outcome).toEqual({ kind: 'not_attempted', reason: 'unresolved', mayRemain: true });
+      expect(releaseHelper.argv).toEqual([]);
+    });
+
+    it.each([
+      ['a copy of a genuine handle', (h: LockHandle) => ({ ...h })],
+      ['a hand-built handle', () => ({ controlDir: DIR, runId: 'run-1' })],
+      ['an unrelated object', () => ({ controlDir: '/elsewhere', runId: 'run-9' })],
+    ])('refuses %s, spawning nothing', async (_label, make) => {
+      const handle = await acquired();
+      const { outcome, helper } = await release(make(handle) as LockHandle);
+      expect(outcome).toEqual({ kind: 'not_attempted', reason: 'unknown_handle' });
+      expect(helper.argv).toEqual([]);
+    });
+
+    it('allows one attempt: a second says so, and an unconfirmed one leaves it unresolved', async () => {
+      const handle = await acquired();
+      expect((await release(handle)).outcome.kind).toBe('released');
+      const again = await release(handle);
+      expect(again.outcome).toEqual({ kind: 'not_attempted', reason: 'already_attempted' });
+      expect(again.helper.argv).toEqual([]);
+
+      const second = await acquired();
+      const unclean = await release(second, { stdout: RELEASED, exit: 1 });
+      expect(unclean.outcome).toEqual({ kind: 'unknown', problems: ['exited 1'], mayRemain: true });
+      const retry = await release(second);
+      expect(retry.outcome).toEqual({
+        kind: 'not_attempted',
+        reason: 'unresolved',
+        mayRemain: true,
+      });
+      expect(retry.helper.argv).toEqual([]); // never retried on its own
+    });
+
+    it('lets only one release be in flight at a time', async () => {
+      const handle = await acquired();
+      const helper = fakeHelper({ stdout: RELEASED });
+      const options = { deadline: Date.now() + 10_000, spawn: helper.spawn };
+      const [first, second] = await Promise.all([
+        releaseLockBounded(handle, options),
+        releaseLockBounded(handle, options),
+      ]);
+      expect([first.kind, second.kind]).toEqual(['released', 'not_attempted']);
+      expect(second).toEqual({ kind: 'not_attempted', reason: 'in_flight' });
+      expect(helper.argv).toHaveLength(1);
+    });
+
+    it('spawns nothing with no time left, and stays usable afterwards', async () => {
+      const handle = await acquired();
+      const spent = await release(handle, { stdout: RELEASED }, { deadline: Date.now() });
+      expect(spent.outcome).toEqual({
+        kind: 'not_attempted',
+        reason: 'budget_spent',
+        mayRemain: true,
+      });
+      expect(spent.helper.argv).toEqual([]);
+      // nothing was tried, so the one attempt is still there
+      expect((await release(handle)).outcome).toEqual({ kind: 'released', diagnostics: [] });
+    });
+
+    it.each([
+      ['two lines', RELEASED.repeat(2), ['the output is not exactly one line']],
+      ['an unknown kind', line({ kind: 'freed', diagnostics: [] }), ['kind is unknown']],
+      ['an acquisition kind', line({ kind: 'acquired', diagnostics: [] }), ['kind is unknown']],
+    ])('reports unknown for %s, saying the lock may remain', async (_label, stdout, problems) => {
+      const handle = await acquired();
+      const { outcome } = await release(handle, { stdout });
+      expect(outcome).toEqual({ kind: 'unknown', problems, mayRemain: true });
+    });
+
+    it('never repeats what a failed release said', async () => {
+      const handle = await acquired();
+      const throwing = (() => {
+        throw new Error(`spawn SENTINEL-PATH ${TOKEN} ENOENT`);
+      }) as unknown as typeof spawn;
+      const outcome = await releaseLockBounded(handle, {
+        deadline: Date.now() + 10_000,
+        spawn: throwing,
+      });
+      expect(outcome).toEqual({
+        kind: 'unknown',
+        problems: ['did not run', 'the output is not exactly one line'],
+        mayRemain: true,
+      });
+      const serialized = JSON.stringify(outcome);
+      for (const secret of [TOKEN, NONCE, 'SENTINEL-PATH'])
+        expect(serialized).not.toContain(secret);
+    });
   });
 });

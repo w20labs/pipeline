@@ -182,10 +182,15 @@ export interface AcquireOptions {
 
 /** Whether the helper is known to have ended, never to have run, or neither. Only this module sees it. */
 type Termination = 'ended' | 'never_ran' | 'unresolved';
-const OWNED = new WeakMap<
-  LockHandle,
-  { readonly token: string; readonly nonce: string; readonly termination: Termination }
->();
+/** Where a handle stands with release: fresh until one is attempted, then spent or unresolved. */
+type ReleaseState = 'fresh' | 'in_flight' | 'spent' | 'unresolved';
+interface Owned {
+  /** The record as prepared: release sends these fields back, never anything a caller passes later. */
+  readonly record: string;
+  readonly termination: Termination;
+  release: ReleaseState;
+}
+const OWNED = new WeakMap<LockHandle, Owned>();
 
 const REASONS = new Set<string>([
   'arguments',
@@ -223,22 +228,28 @@ const keysOf = (value: Record<string, unknown>) => Object.keys(value).sort().joi
 const validErrno = (value: unknown): value is string | null =>
   value === null || (typeof value === 'string' && ERRNO.test(value));
 
-const diagnosticsOf = (value: unknown): readonly LockDiagnostic[] | undefined => {
+const diagnosticsOf = (
+  value: unknown,
+  steps: ReadonlySet<string>,
+): readonly LockDiagnostic[] | undefined => {
   if (!Array.isArray(value)) return undefined;
   const copies: LockDiagnostic[] = [];
   for (const entry of value as unknown[]) {
     const fields = record(entry);
     if (fields === undefined || keysOf(fields) !== 'errno,step') return undefined;
     const { step, errno } = fields;
-    if (typeof step !== 'string' || !STEPS.has(step) || !validErrno(errno)) return undefined;
+    if (typeof step !== 'string' || !steps.has(step) || !validErrno(errno)) return undefined;
     copies.push(Object.freeze({ step, errno }));
   }
   return Object.freeze(copies);
 };
 
 /** The helper's line, or a problem. Fixed wording only: nothing it wrote is repeated. */
-const parsed = (
+const parsedAs = (
   stdout: string,
+  kinds: Record<string, string>,
+  reasons: ReadonlySet<string>,
+  steps: ReadonlySet<string>,
 ):
   | {
       readonly kind: string;
@@ -257,14 +268,14 @@ const parsed = (
   const fields = record(value);
   if (fields === undefined) return 'the output is not an object';
   const { kind } = fields;
-  if (typeof kind !== 'string' || !Object.hasOwn(KEYS, kind)) return 'kind is unknown';
-  if (keysOf(fields) !== KEYS[kind]) return `the ${kind} result has the wrong fields`;
-  const diagnostics = diagnosticsOf(fields['diagnostics']);
+  if (typeof kind !== 'string' || !Object.hasOwn(kinds, kind)) return 'kind is unknown';
+  if (keysOf(fields) !== kinds[kind]) return `the ${kind} result has the wrong fields`;
+  const diagnostics = diagnosticsOf(fields['diagnostics'], steps);
   if (diagnostics === undefined) return 'diagnostics are malformed';
   if (kind === 'refused') {
     // a string, not something that merely stringifies to one: ["capability"] must not pass
     const reason = fields['reason'];
-    if (typeof reason !== 'string' || !REASONS.has(reason)) return 'reason is unknown';
+    if (typeof reason !== 'string' || !reasons.has(reason)) return 'reason is unknown';
     if (!validErrno(fields['errno'])) return 'errno is malformed';
   }
   return { kind, fields, diagnostics };
@@ -329,10 +340,10 @@ export const acquireLockBounded = async (
   });
   // built from the snapshot the record was built from, never from the caller's object
   const handle: LockHandle = Object.freeze({ controlDir, runId: state.owner.runId });
-  OWNED.set(handle, { token: state.token, nonce: state.nonce, termination: classify(outcome) });
+  OWNED.set(handle, { record: state.input, termination: classify(outcome), release: 'fresh' });
 
   const termination = helperTermination(outcome);
-  const line = parsed(termination.stdout);
+  const line = parsedAs(termination.stdout, KEYS, REASONS, STEPS);
   // sanitized first: a spawn error's detail is the system's text, and may carry anything
   const problems = [
     ...termination.problems.map(category),
@@ -350,4 +361,161 @@ export const acquireLockBounded = async (
       diagnostics,
     });
   return Object.freeze({ kind: kind as 'acquired' | 'held', handle, diagnostics });
+};
+
+export type ReleaseReason =
+  | 'arguments'
+  | 'capability'
+  | 'directory_missing'
+  | 'directory_unusable'
+  | 'lock_unusable'
+  | 'not_regular'
+  | 'fstat_failed'
+  | 'read_failed'
+  | 'too_large'
+  | 'stat_failed'
+  | 'unlink_failed';
+
+export type ReleaseOutcome =
+  /** What the helper established about the lock, from a run known to have been clean. */
+  | {
+      readonly kind: 'released' | 'missing' | 'not_ours' | 'unrecognized' | 'replaced';
+      readonly diagnostics: readonly LockDiagnostic[];
+    }
+  | {
+      readonly kind: 'refused';
+      readonly reason: ReleaseReason;
+      readonly errno: string | null;
+      readonly diagnostics: readonly LockDiagnostic[];
+    }
+  /** Whether the lock is gone is not established. It may remain. */
+  | { readonly kind: 'unknown'; readonly problems: readonly string[]; readonly mayRemain: true }
+  /** Nothing was spawned. `unresolved` keeps the acquisition's own, distinct report. */
+  | {
+      readonly kind: 'not_attempted';
+      readonly reason:
+        | 'unknown_handle'
+        | 'never_ran'
+        | 'unresolved'
+        | 'in_flight'
+        | 'already_attempted'
+        | 'budget_spent';
+      readonly mayRemain?: true;
+    };
+
+export interface ReleaseOptions {
+  readonly deadline: number;
+  readonly python?: string;
+  readonly spawn?: typeof nodeSpawn;
+  readonly now?: () => number;
+}
+
+const RELEASE_REASONS = new Set<string>([
+  'arguments',
+  'capability',
+  'directory_missing',
+  'directory_unusable',
+  'lock_unusable',
+  'not_regular',
+  'fstat_failed',
+  'read_failed',
+  'too_large',
+  'stat_failed',
+  'unlink_failed',
+]);
+const RELEASE_KINDS: Record<string, string> = {
+  released: 'diagnostics,kind',
+  missing: 'diagnostics,kind',
+  not_ours: 'diagnostics,kind',
+  unrecognized: 'diagnostics,kind',
+  replaced: 'diagnostics,kind',
+  refused: 'diagnostics,errno,kind,reason',
+};
+const RELEASE_STEPS = new Set<string>([
+  'close_lock',
+  'close_directory',
+  'temp_unusable',
+  'temp_fstat_failed',
+  'temp_read_failed',
+  'temp_too_large',
+  'temp_partial',
+  'temp_unrecognized',
+  'temp_stat_failed',
+  'temp_replaced', // the leftover was no longer the file that was read, so it was left alone
+
+  'temp_unlink_failed',
+  'temp_close_failed',
+]);
+
+const notAttempted = (
+  reason: Extract<ReleaseOutcome, { kind: 'not_attempted' }>['reason'],
+  mayRemain = false,
+): ReleaseOutcome =>
+  Object.freeze({
+    kind: 'not_attempted',
+    reason,
+    ...(mayRemain ? { mayRemain: true as const } : {}),
+  });
+
+/**
+ * Release the lock this handle stands for — if this module issued the handle, if the acquisition
+ * ended, and if it has not been attempted already.
+ *
+ * Order matters: the handle, then eligibility, then the attempt state, then the budget. An
+ * acquisition whose helper never terminated keeps its own report even when the budget is also gone.
+ * Nothing is ever retried automatically: an unconfirmed release says the lock may remain and leaves
+ * the rest to the operator.
+ */
+export const releaseLockBounded = async (
+  handle: LockHandle,
+  options: ReleaseOptions,
+): Promise<ReleaseOutcome> => {
+  const { deadline, python, spawn, now } = options;
+  const owned = OWNED.get(handle); // a copied or fabricated handle is in no map: fail closed
+  if (owned === undefined) return notAttempted('unknown_handle');
+  if (owned.termination === 'never_ran') return notAttempted('never_ran');
+  if (owned.termination === 'unresolved') return notAttempted('unresolved', true);
+  if (owned.release === 'in_flight') return notAttempted('in_flight');
+  if (owned.release === 'spent') return notAttempted('already_attempted');
+  if (owned.release === 'unresolved') return notAttempted('unresolved', true);
+  // nothing tried, so the handle stays usable: a later call with time left may still release it
+  if ((now ?? Date.now)() >= deadline) return notAttempted('budget_spent', true);
+
+  owned.release = 'in_flight'; // marked before awaiting, so a second call cannot overlap this one
+  const outcome = await runChild(
+    python ?? 'python3',
+    [LOCK_HELPER, '--dir', handle.controlDir, '--mode', 'release'],
+    {
+      deadline,
+      termGraceMs: LOCK_TERM_GRACE_MS,
+      killGraceMs: LOCK_KILL_GRACE_MS,
+      spawn: spawn ?? nodeSpawn,
+      now: now ?? Date.now,
+      maxOutputBytes: LOCK_OUTPUT_BYTES,
+      input: owned.record,
+    },
+  );
+  const termination = helperTermination(outcome);
+  const line = parsedAs(termination.stdout, RELEASE_KINDS, RELEASE_REASONS, RELEASE_STEPS);
+  const problems = [
+    ...termination.problems.map(category),
+    ...(typeof line === 'string' ? [line] : []),
+  ];
+  if (problems.length > 0) {
+    owned.release = 'unresolved'; // whether the lock is gone is not established
+    return Object.freeze({ kind: 'unknown', problems: Object.freeze(problems), mayRemain: true });
+  }
+  owned.release = 'spent';
+  const { kind, fields, diagnostics } = line as Exclude<typeof line, string>;
+  if (kind === 'refused')
+    return Object.freeze({
+      kind,
+      reason: fields['reason'] as ReleaseReason,
+      errno: fields['errno'] as string | null,
+      diagnostics,
+    });
+  return Object.freeze({
+    kind: kind as 'released' | 'missing' | 'not_ours' | 'unrecognized' | 'replaced',
+    diagnostics,
+  });
 };
