@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import {
   existsSync,
   mkdirSync,
@@ -80,9 +81,11 @@ const trackingSpawn = ((command: string, args: string[], options: object) => {
   return child;
 }) as unknown as typeof spawn;
 
-afterEach(async () => {
-  const [children, created] = [tracked, dirs];
-  [tracked, dirs] = [[], []];
+/**
+ * Ends every child not already known to have ended, and reports the ones it cannot confirm. One
+ * unconfirmed child never stops the rest from being signalled and waited for.
+ */
+const reapChildren = async (children: readonly Tracked[]): Promise<string[]> => {
   const unconfirmed: string[] = [];
   for (const t of children) {
     if (t.exit !== undefined || (t.error !== undefined && t.child.pid === undefined)) continue;
@@ -92,11 +95,18 @@ afterEach(async () => {
       unconfirmed.push(`pid ${String(t.child.pid)}: SIGKILL threw: ${String(cause)}`);
     }
     const ended = await new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => resolve(false), 2_000);
+      const timer = realSetTimeout(() => resolve(false), 2_000);
       t.child.once('exit', () => (clearTimeout(timer), resolve(true)));
     });
     if (!ended) unconfirmed.push(`pid ${String(t.child.pid)}: no exit within 2 s of SIGKILL`);
   }
+  return unconfirmed;
+};
+
+afterEach(async () => {
+  const [children, created] = [tracked, dirs];
+  [tracked, dirs] = [[], []];
+  const unconfirmed = await reapChildren(children);
   // a directory goes only once every process that could still be using it is known to have ended
   if (unconfirmed.length > 0)
     throw new Error(
@@ -1080,5 +1090,133 @@ describe('a composed run', () => {
     // acquisition, the manifest read and the release all went through the captured interpreter
     expect(readFileSync(marker, 'utf8')).toBe('xxx');
     expect(tracked).toHaveLength(3);
+  }, 60_000);
+
+  it('exhausts the phase budget after the lock, leaving the manifest and later work unrun', async () => {
+    const at = workspace();
+    const body = bootstrapManifest(at);
+    const before = statSync(join(at.control, 'bootstrap.json')).ino;
+    const BUDGET = 8_000;
+    const RESERVE = 4_000;
+    const origin = 3_000_000;
+    const clock = { t: origin };
+    const ran: string[] = [];
+    const result = await researchRun(
+      configOf(at, { budgetMs: BUDGET, cleanupReserveMs: RESERVE }),
+      {
+        spawn: trackingSpawn,
+        now: () => clock.t,
+        // the budget is spent the moment the lock is taken: deterministic, and no waiting
+        lock: {
+          acquire: async (dir, owner, options) => {
+            const outcome = await acquireLockBounded(dir, owner, options);
+            clock.t = origin + BUDGET - RESERVE; // exactly the phase deadline
+            return outcome;
+          },
+        },
+        after: [observing('observe', () => ran.push('observe'), at.control)],
+      },
+    );
+
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'not_run'],
+      ['observe', 'not_run'],
+    ]);
+    expect(result.phases[1]).toMatchObject({ why: 'the run budget was spent' });
+    expect(ran).toEqual([]);
+    // the reserve was untouched, so the lock still went back
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(body);
+    expect(statSync(join(at.control, 'bootstrap.json')).ino).toBe(before);
+    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0]); // acquisition and release only
+  }, 60_000);
+
+  it('reaps every tracked child even when one cannot be confirmed', async () => {
+    // fabricated records: nothing here has a real pid, so no live process is ever signalled
+    const stub = (ends: boolean) => {
+      const child = Object.assign(new EventEmitter(), {
+        pid: undefined,
+        kill: (signal?: NodeJS.Signals | number) => {
+          signalled.push(String(signal));
+          if (ends) queueMicrotask(() => child.emit('exit', null, 'SIGKILL'));
+          return true;
+        },
+      });
+      return { child, kills: [] } as unknown as Tracked;
+    };
+    const signalled: string[] = [];
+    const ended = {
+      child: { pid: 1 },
+      kills: [],
+      exit: { code: 0, signal: null },
+    } as unknown as Tracked;
+
+    const unconfirmed = await reapChildren([ended, stub(false), stub(true)]);
+
+    expect(signalled).toEqual(['SIGKILL', 'SIGKILL']); // the third was still signalled
+    expect(unconfirmed).toEqual(['pid undefined: no exit within 2 s of SIGKILL']);
+    // and the workspace that one belongs to is kept, named, by the same decision afterEach uses
+    const kept = mkdtempSync(join(tmpdir(), 'pipeline-reap-kept-'));
+    try {
+      expect(disposeOf([{ path: kept, why: unconfirmed.join('; ') }])).toEqual([
+        `retained ${kept}: pid undefined: no exit within 2 s of SIGKILL`,
+      ]);
+      expect(existsSync(kept)).toBe(true);
+    } finally {
+      rmSync(kept, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('escalates to SIGKILL when the manifest helper resists, leaving the lock work normal', async () => {
+    const at = workspace();
+    const body = bootstrapManifest(at);
+    // the shim stands in for the interpreter, but resists only the manifest read: acquisition and
+    // release run through it untouched, so what escalation does here is not confused with them
+    const shim = join(at.scratch, 'stubborn-python');
+    writeFileSync(
+      shim,
+      [
+        '#!/usr/bin/env python3',
+        'import os, runpy, signal, sys, time',
+        "if sys.argv[1].endswith('read-control-file.py'):",
+        '    signal.signal(signal.SIGTERM, signal.SIG_IGN)',
+        '    time.sleep(3600)',
+        'sys.argv = sys.argv[1:]',
+        'runpy.run_path(sys.argv[0], run_name="__main__")',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+
+    const result = await researchRun(configOf(at, { budgetMs: 8_000, cleanupReserveMs: 4_000 }), {
+      spawn: trackingSpawn,
+      python: shim,
+    });
+
+    expect(result.outcome).toMatchObject({ name: 'manifest', status: 'refused' });
+    expect((result.outcome as { why: string }).why).toContain(
+      'the bootstrap manifest could not be read',
+    );
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'refused'],
+    ]);
+    // the manifest child ignored SIGTERM and was killed; its own exit says so, independently
+    expect(tracked).toHaveLength(3);
+    expect(tracked[1]?.kills).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(tracked[1]?.exit).toEqual({ code: null, signal: 'SIGKILL' });
+    // acquisition and release were ordinary runs through the same interpreter
+    expect([tracked[0]?.exit, tracked[2]?.exit]).toEqual([
+      { code: 0, signal: null },
+      { code: 0, signal: null },
+    ]);
+    expect(tracked[0]?.kills).toEqual([]);
+    expect(tracked[2]?.kills).toEqual([]);
+    // the lock went back, and the manifest it could not read is exactly as it was
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(body);
   }, 60_000);
 });
