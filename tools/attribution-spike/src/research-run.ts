@@ -1,9 +1,9 @@
 /**
- * Composing a run: the lock phase first, then whatever else the caller supplies.
+ * Composing a run: the lock first, then the bootstrap manifest, then whatever the caller supplies.
  *
- * Lock-only by design. The bootstrap manifest, the agent launches and everything they need are not
- * composed here, so a run assembled by this module is not a complete research run — it establishes
- * who holds the lock and nothing more.
+ * Both are the run's own preconditions: nothing supplied runs until this run holds the lock and the
+ * manifest it was given validates. The bootstrap session itself, the agent launches and everything
+ * they need are not composed here, so this is still not a complete research run.
  *
  * Everything the run depends on is copied before the first await, and the same copy reaches both
  * the lock phase and the runner: a caller changing its configuration, its list or a phase object
@@ -11,7 +11,9 @@
  */
 import type { spawn as nodeSpawn } from 'node:child_process';
 
+import { readControlFile } from './control-file.js';
 import { type LockDeps, lockPhase } from './lock-phase.js';
+import { manifestPhase } from './manifest.js';
 import type { LockOwner } from './lock.js';
 import {
   nodeRunnerFs,
@@ -22,7 +24,7 @@ import {
   runResearch,
 } from './runner.js';
 
-const LOCK = 'lock';
+const RESERVED = ['lock', 'manifest'] as const;
 
 export interface ResearchRunOptions {
   /** Phases to run after the lock, in order. The lock is always first and cannot be replaced. */
@@ -89,16 +91,23 @@ export const researchRun = async (
   const acquire = injected?.acquire;
   const release = injected?.release;
 
-  if (after.some((p) => p.name === LOCK))
+  const claimed = after.find((p) => (RESERVED as readonly string[]).includes(p.name));
+  if (claimed !== undefined)
     return refusedBeforeStart(
       after.map((p) => p.name),
-      `a supplied phase may not be named ${LOCK}`,
+      `a supplied phase may not be named ${claimed.name}`,
     );
 
   const owner: LockOwner = Object.freeze({
     runId: c.runId,
     pid: process.pid,
     startedAt: new Date(now()).toISOString(),
+  });
+  // captured with everything else, so the reader cannot be redirected once the run is under way
+  const bounds = Object.freeze({
+    ...(python === undefined ? {} : { python }),
+    ...(spawn === undefined ? {} : { spawn }),
+    now,
   });
   const lock = lockPhase(
     { controlDir: c.controlDir, owner },
@@ -110,5 +119,9 @@ export const researchRun = async (
       ...(release === undefined ? {} : { release }),
     },
   );
-  return runResearch(c, [lock, ...after], fs, now);
+  const manifest = manifestPhase(
+    { controlDir: c.controlDir, researchConfig: c.researchConfig },
+    (dir, name, options) => readControlFile(dir, name, { ...options, ...bounds }),
+  );
+  return runResearch(c, [lock, manifest, ...after], fs, now);
 };

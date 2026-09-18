@@ -148,6 +148,19 @@ const deferred = <T>() => {
   return { promise, resolve: (value: T) => resolve(value) };
 };
 const status = (result: RunResult) => result.phases.map((p) => [p.name, p.status]);
+/** A bootstrap manifest the manifest phase accepts, for this workspace's research configuration. */
+const bootstrapManifest = (at: { control: string; research: string }) => {
+  const body = `${JSON.stringify({
+    version: 1,
+    configPath: at.research,
+    claudeVersion: '2.1.0',
+    bootstrappedAt: '2026-09-17T08:00:00Z',
+    separateAuthorization: 'unknown',
+    bootstrapSessionClosed: true,
+  })}\n`;
+  writeFileSync(join(at.control, 'bootstrap.json'), body);
+  return body;
+};
 /** Another run's lock, written exactly as the helper writes one. */
 const foreignLock = (dir: string) =>
   writeFileSync(
@@ -164,6 +177,7 @@ const foreignLock = (dir: string) =>
 describe('a composed run', () => {
   it('holds the lock while the run is under way, and gives it back at the end', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     const held: string[] = [];
     const result = await researchRun(configOf(at), {
       spawn: trackingSpawn,
@@ -179,6 +193,7 @@ describe('a composed run', () => {
     expect(result.outcome).toEqual({ kind: 'completed' });
     expect(status(result)).toEqual([
       ['lock', 'completed'],
+      ['manifest', 'completed'],
       ['observe', 'completed'],
     ]);
     expect(result.phases[0]).toMatchObject({
@@ -190,7 +205,8 @@ describe('a composed run', () => {
       runId: 'run-1',
       pid: process.pid,
     });
-    expect(readdirSync(at.control)).toEqual([]); // released, and its temporary file cleaned up
+    // the lock and its temporary file are gone; the manifest it was given is untouched
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
     expect(result.cleanupDiagnostics).toEqual([]);
 
     const summary = JSON.parse(
@@ -198,10 +214,12 @@ describe('a composed run', () => {
     ) as RunResult;
     expect(status(summary)).toEqual([
       ['lock', 'completed'],
+      ['manifest', 'completed'],
       ['observe', 'completed'],
     ]);
-    expect(tracked).toHaveLength(2); // one acquisition, one release
+    expect(tracked).toHaveLength(3); // acquisition, the manifest read, release
     expect(tracked.map((t) => [t.exit?.code, t.kills])).toEqual([
+      [0, []],
       [0, []],
       [0, []],
     ]);
@@ -224,6 +242,7 @@ describe('a composed run', () => {
     expect((result.outcome as { why: string }).why).toBe('another run holds the lock');
     expect(status(result)).toEqual([
       ['lock', 'refused'],
+      ['manifest', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]); // nothing ran behind a lock this run does not hold
@@ -240,6 +259,7 @@ describe('a composed run', () => {
 
   it('reports a lock replaced during the run, leaving the replacement in place', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     let put: { bytes: string; ino: number } | undefined;
     const result = await researchRun(configOf(at), {
       spawn: trackingSpawn,
@@ -276,6 +296,7 @@ describe('a composed run', () => {
 
   it('puts the lock first, and refuses a supplied phase that claims its name', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     const order: string[] = [];
     const ordered = await researchRun(configOf(at), {
       spawn: trackingSpawn,
@@ -286,6 +307,7 @@ describe('a composed run', () => {
     });
     expect(status(ordered)).toEqual([
       ['lock', 'completed'],
+      ['manifest', 'completed'],
       ['first', 'completed'],
       ['second', 'completed'],
     ]);
@@ -311,6 +333,7 @@ describe('a composed run', () => {
 
   it('uses one snapshot: nothing a caller changes mid-run moves the lock or the work', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     const config = configOf(at) as Mutable<RunConfig>;
     const held: string[] = [];
     const ran: string[] = [];
@@ -342,6 +365,7 @@ describe('a composed run', () => {
     await creating.promise;
     config.runId = 'moved'; // the configuration...
     config.controlDir = at.scratch;
+    config.researchConfig = at.scratch; // including the path the manifest is validated against
     after.push(observing('late', () => ran.push('late'), at.control)); // ...the list...
     observer.run = async () => (ran.push('replaced'), { kind: 'completed' }); // ...and a method
     release.resolve();
@@ -350,6 +374,7 @@ describe('a composed run', () => {
     expect(ran).toEqual(['original']); // the bound method, and no phase added after the fact
     expect(status(result)).toEqual([
       ['lock', 'completed'],
+      ['manifest', 'completed'],
       ['observe', 'completed'],
     ]);
     // the lock identified the run the snapshot named, in the directory it named
@@ -359,26 +384,52 @@ describe('a composed run', () => {
     });
     expect(existsSync(join(at.runs, 'run-1', 'run.json'))).toBe(true);
     expect(existsSync(join(at.runs, 'moved'))).toBe(false);
-    expect(readdirSync(at.control)).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']); // the manifest is not the lock's
   }, 60_000);
 
   it('reports a spent budget without a summary, and says the lock was left behind', async () => {
     const at = workspace();
-    const slow = deferred<undefined>();
-    let timer: NodeJS.Timeout | undefined;
-    const result = await researchRun(configOf(at, { budgetMs: 2_000, cleanupReserveMs: 1_000 }), {
-      spawn: trackingSpawn,
-      after: [
-        {
-          name: 'slow',
-          run: async () => ({ kind: 'completed' }),
-          // outlives the run deadline, so the cleanups after it never get their turn
-          cleanup: () => ((timer = setTimeout(() => slow.resolve(undefined), 5_000)), slow.promise),
-        },
-      ],
-    });
+    bootstrapManifest(at);
+    const BUDGET = 4_000;
+    const RESERVE = 2_000;
+    const origin = 2_000_000; // one captured origin, as everywhere else on controlled time
+    const clock = { t: origin };
+    const gate = deferred<undefined>();
+    const cleanup = { started: false, settled: false };
+    const slow: Phase = {
+      name: 'slow',
+      run: async () => ({ kind: 'completed' }),
+      // held open until the test lets go, so the run deadline arrives while it is still running
+      cleanup: async () => {
+        cleanup.started = true;
+        await gate.promise;
+        cleanup.settled = true;
+        return undefined;
+      },
+    };
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const run = observed(
+      researchRun(configOf(at, { budgetMs: BUDGET, cleanupReserveMs: RESERVE }), {
+        spawn: trackingSpawn,
+        now: () => clock.t,
+        after: [slow],
+      }),
+    );
 
     try {
+      // bounded on real timers: the cleanup must be running, and the runner's timeout for it
+      // registered, before any fake time moves — inferring either from elapsed time is what made
+      // this test depend on which side of the deadline the real clock happened to be on
+      await untilReady('the slow cleanup to start', () => cleanup.started, 20_000);
+      await untilReady('its runner timeout', () => vi.getTimerCount() >= 1, 20_000);
+
+      clock.t = origin + BUDGET; // exactly the run deadline
+      await vi.advanceTimersByTimeAsync(BUDGET);
+      await untilReady('the composed run', () => run.state.done, 20_000);
+      const result = await run.work;
+
+      // the runner gave up on the cleanup it was inside, then found no budget for the next one
       expect(result.cleanupDiagnostics).toEqual([
         'slow: cleanup did not finish by the run deadline',
         'lock: cleanup not run: the run budget was spent',
@@ -389,28 +440,38 @@ describe('a composed run', () => {
         why: 'the run budget was spent',
       });
       expect(existsSync(join(at.runs, 'run-1', 'run.json'))).toBe(false); // correctly unwritten
-      expect(tracked).toHaveLength(1); // the acquisition only: no release was ever started
+      expect(tracked).toHaveLength(2); // the acquisition and the manifest read; no release
       // the lock this run took is still there, which is exactly what the diagnostics say
       expect(JSON.parse(readFileSync(join(at.control, 'run.lock'), 'utf8'))).toMatchObject({
         runId: 'run-1',
       });
     } finally {
-      // however the assertions ended, the delayed cleanup settles before teardown removes the
-      // directory it was handed: a failure must not let disposal outrun work still holding it
-      clearTimeout(timer);
-      slow.resolve(undefined);
-      await slow.promise;
-      rmSync(join(at.control, 'run.lock'), { force: true });
+      vi.useRealTimers();
+      gate.resolve(undefined);
+      const outstanding: string[] = [];
+      for (const [what, done] of [
+        ['the slow cleanup', () => cleanup.settled],
+        ['the composed run', () => run.state.done],
+      ] as [string, () => boolean][])
+        if (!(await confirmed(what, done))) outstanding.push(`${what} did not settle`);
+      if (outstanding.length > 0) retain(at.base, outstanding.join('; '));
+      else rmSync(join(at.control, 'run.lock'), { force: true });
     }
   }, 60_000);
 
   it('reads the run id once, and everything it builds uses that one value', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     const reads: string[] = [];
     const config = configOf(at) as Mutable<RunConfig>;
     // a valid getter, answering differently after the first read: one snapshot sees only 'run-1'
     Object.defineProperty(config, 'runId', {
-      get: () => (reads.push('read'), reads.length === 1 ? 'run-1' : 'moved'),
+      get: () => (reads.push('runId'), reads.length === 1 ? 'run-1' : 'moved'),
+    });
+    // the same for the path the manifest is validated against: read once, or it validates another
+    const configReads: string[] = [];
+    Object.defineProperty(config, 'researchConfig', {
+      get: () => (configReads.push('read'), configReads.length === 1 ? at.research : at.scratch),
     });
     const held: string[] = [];
     const result = await researchRun(config, {
@@ -427,6 +488,7 @@ describe('a composed run', () => {
     expect(reads).toHaveLength(1);
     expect(JSON.parse(held[0] ?? '')).toMatchObject({ runId: 'run-1' }); // the published record
     expect(result.phases[0]).toMatchObject({ evidence: { runId: 'run-1' } });
+    expect(result.phases[1]).toMatchObject({ name: 'manifest', status: 'completed' });
     expect(existsSync(join(at.runs, 'run-1', 'run.json'))).toBe(true); // and the run directory
     expect(existsSync(join(at.runs, 'moved'))).toBe(false);
   }, 60_000);
@@ -459,6 +521,7 @@ describe('a composed run', () => {
 
   it('measures the lock on the clock it was given, not on the wall clock', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     // an advancing clock a minute behind: the deadline computed here must reach the wrappers, or
     // acquisition compares it against the wall clock and reports a run that never happened
     const result = await researchRun(configOf(at), {
@@ -467,11 +530,15 @@ describe('a composed run', () => {
     });
 
     expect(result.outcome).toEqual({ kind: 'completed' });
-    expect(status(result)).toEqual([['lock', 'completed']]);
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'completed'],
+    ]);
     expect(result.phases[0]).toMatchObject({ evidence: { runId: 'run-1', diagnostics: [] } });
     expect(result.cleanupDiagnostics).toEqual([]); // the release measured on it too
-    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0]); // acquisition and release both ran
-    expect(readdirSync(at.control)).toEqual([]);
+    // the interpreter, the spawn and this clock all reached the manifest reader as well
+    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0, 0]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
   }, 60_000);
 
   it('cleans up after an acquisition that published and then hung', async () => {
@@ -519,6 +586,7 @@ describe('a composed run', () => {
 
   it('uses the lock functions it captured, not ones swapped in mid-run', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     const swapped: string[] = [];
     const used: string[] = [];
     const creating = deferred<void>();
@@ -558,7 +626,7 @@ describe('a composed run', () => {
     expect(swapped).toEqual([]); // neither replacement was reached
     expect(used).toEqual(['acquire', 'release']); // both captured functions were
     expect(result.outcome).toEqual({ kind: 'completed' });
-    expect(readdirSync(at.control)).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
   }, 60_000);
 
   /**
@@ -626,6 +694,7 @@ describe('a composed run', () => {
 
   it('reconciles an acquisition delivered during the cleanup reserve', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     const w = withheld();
     // the phase deadline falls at +2 s, the run deadline at +6 s: delivery lands inside the reserve
     const run = observed(
@@ -641,9 +710,9 @@ describe('a composed run', () => {
       await untilReady('the composed run', () => run.state.done, 15_000);
       const result = await run.work;
 
-      expect(result.phases.map((p) => p.status)).toEqual(['timed_out']);
+      expect(result.phases.map((p) => p.status)).toEqual(['timed_out', 'not_run']);
       expect(result.cleanupDiagnostics).toEqual([]); // reconciled, then released
-      expect(readdirSync(at.control)).toEqual([]);
+      expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
       expect(tracked).toHaveLength(2);
     } finally {
       expect(await settleWithheld(w, run, at.base)).toEqual([]);
@@ -703,6 +772,7 @@ describe('a composed run', () => {
 
   it('reads the supplied phase list once', async () => {
     const at = workspace();
+    bootstrapManifest(at);
     const reads: string[] = [];
     const ran: string[] = [];
     const impostor = observing('lock', () => ran.push('impostor'), at.control);
@@ -713,8 +783,12 @@ describe('a composed run', () => {
     });
 
     const result = await researchRun(configOf(at), options);
+    expect(reads).toHaveLength(1);
     expect(reads).toHaveLength(1); // one read, and the composition is built from it
-    expect(status(result)).toEqual([['lock', 'completed']]);
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'completed'], // validated against the path read the first time
+    ]);
     expect(ran).toEqual([]);
   }, 60_000);
 
@@ -885,4 +959,126 @@ describe('a composed run', () => {
       rmSync(at.base, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it('keeps the manifest it was given, and carries its evidence into the summary', async () => {
+    const at = workspace();
+    const body = bootstrapManifest(at);
+    const before = statSync(join(at.control, 'bootstrap.json')).ino;
+
+    const result = await researchRun(configOf(at), { spawn: trackingSpawn });
+
+    expect(result.outcome).toEqual({ kind: 'completed' });
+    expect(result.phases[1]).toMatchObject({
+      name: 'manifest',
+      status: 'completed',
+      evidence: {
+        claudeVersion: '2.1.0',
+        bootstrappedAt: '2026-09-17T08:00:00Z',
+        separateAuthorization: 'unknown',
+      },
+    });
+    const summary = JSON.parse(
+      readFileSync(join(at.runs, 'run-1', 'run.json'), 'utf8'),
+    ) as RunResult;
+    expect(summary.phases[1]).toMatchObject({
+      evidence: { claudeVersion: '2.1.0', separateAuthorization: 'unknown' },
+    });
+    // the lock and its temporary file go; the manifest is not this run's to touch
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(body);
+    expect(statSync(join(at.control, 'bootstrap.json')).ino).toBe(before);
+  }, 60_000);
+
+  it('stops supplied work when the manifest is missing, and still releases the lock', async () => {
+    const at = workspace();
+    const ran: string[] = [];
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      after: [observing('observe', () => ran.push('observe'), at.control)],
+    });
+
+    expect(result.outcome).toMatchObject({ name: 'manifest', status: 'refused' });
+    expect((result.outcome as { why: string }).why).toBe('the bootstrap manifest is missing');
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'refused'],
+      ['observe', 'not_run'],
+    ]);
+    expect(ran).toEqual([]); // nothing supplied runs without a manifest
+    // the lock is given back even though the run stopped at the phase after it
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual([]);
+  }, 60_000);
+
+  it('stops supplied work when the manifest is invalid, and leaves it exactly as found', async () => {
+    const at = workspace();
+    const body = `${JSON.stringify({
+      version: 1,
+      configPath: '/somewhere/else', // not this run's research configuration
+      claudeVersion: '2.1.0',
+      bootstrappedAt: '2026-09-17T08:00:00Z',
+      separateAuthorization: true,
+      bootstrapSessionClosed: true,
+    })}\n`;
+    writeFileSync(join(at.control, 'bootstrap.json'), body);
+    const before = statSync(join(at.control, 'bootstrap.json')).ino;
+    const ran: string[] = [];
+
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      after: [observing('observe', () => ran.push('observe'), at.control)],
+    });
+
+    expect((result.outcome as { why: string }).why).toBe(
+      'the bootstrap manifest is invalid: configPath does not name this research configuration',
+    );
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'refused'],
+      ['observe', 'not_run'],
+    ]);
+    expect(ran).toEqual([]);
+    expect(result.cleanupDiagnostics).toEqual([]); // released regardless of why the run stopped
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(body);
+    expect(statSync(join(at.control, 'bootstrap.json')).ino).toBe(before);
+  }, 60_000);
+
+  it('refuses a supplied phase that claims the manifest’s name', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const ran: string[] = [];
+    const claimed = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      after: [observing('manifest', () => ran.push('impostor'), at.control)],
+    });
+
+    expect(claimed.outcome).toEqual({
+      name: 'start',
+      status: 'refused',
+      why: 'a supplied phase may not be named manifest',
+    });
+    expect(ran).toEqual([]);
+    expect(tracked).toEqual([]); // nothing was started at all
+    expect(existsSync(join(at.runs, 'run-1'))).toBe(false);
+  }, 60_000);
+
+  it('sends the interpreter it captured to the manifest reader as well', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const marker = join(at.scratch, 'interpreters');
+    const shim = join(at.scratch, 'recording-python');
+    writeFileSync(
+      shim,
+      ['#!/bin/sh', `printf 'x' >> ${JSON.stringify(marker)}`, 'exec python3 "$@"', ''].join('\n'),
+      { mode: 0o755 },
+    );
+
+    const result = await researchRun(configOf(at), { spawn: trackingSpawn, python: shim });
+
+    expect(result.outcome).toEqual({ kind: 'completed' });
+    // acquisition, the manifest read and the release all went through the captured interpreter
+    expect(readFileSync(marker, 'utf8')).toBe('xxx');
+    expect(tracked).toHaveLength(3);
+  }, 60_000);
 });
