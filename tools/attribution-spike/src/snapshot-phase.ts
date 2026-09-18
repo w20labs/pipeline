@@ -82,7 +82,7 @@ const STREAM = new Set([
 ]);
 
 /** One fixed token per problem. Anything unrecognized says exactly that and nothing more. */
-const problemCategory = (problem: string): string => {
+export const problemCategory = (problem: string): string => {
   if (problem.startsWith('the helper did not run: ')) return 'did not run';
   if (Object.hasOwn(TERMINATION, problem)) return TERMINATION[problem] as string;
   const killed = KILLED.exec(problem);
@@ -147,13 +147,15 @@ const interpretations = (message: string): string[] => {
   return found;
 };
 
-const diagnosticCategory = (message: string): string => {
+export const diagnosticCategory = (message: string): string => {
   const found = interpretations(message);
   return found.length === 1 ? (found[0] as string) : 'unrecognized';
 };
 
 /** Categories with their counts, in a fixed order, so a summary never repeats what was written. */
-const counted = (messages: readonly string[]): readonly { category: string; count: number }[] => {
+export const counted = (
+  messages: readonly string[],
+): readonly { category: string; count: number }[] => {
   const totals = new Map<string, number>();
   for (const message of messages) {
     const category = diagnosticCategory(message);

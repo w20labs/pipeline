@@ -204,6 +204,65 @@ describe('the research run skeleton', () => {
     });
   });
 
+  it('keeps evidence a refusing phase reported, and invents none when it reports one', async () => {
+    clocked();
+    const { fs, written } = fakeFs();
+    const phases: Phase[] = [
+      {
+        name: 'quiescence',
+        run: async () => ({
+          kind: 'refused',
+          why: 'the tree differs between the two walks',
+          evidence: { rows: { total: 2, zone: { transcript: 2, configuration: 0 } } },
+        }),
+      },
+      { name: 'later', run: async () => ({ kind: 'completed' }) },
+    ];
+    const r = await runResearch(CONFIG, phases, fs);
+    const path = '/cache/research/runs/run-1/run.json';
+
+    expect(r.phases).toEqual([
+      {
+        ...AT,
+        name: 'quiescence',
+        status: 'refused',
+        why: 'the tree differs between the two walks',
+        evidence: { rows: { total: 2, zone: { transcript: 2, configuration: 0 } } },
+      },
+      // stopped by the refusal, and carrying no evidence of its own
+      { name: 'later', status: 'not_run', why: 'the run stopped at quiescence' },
+    ]);
+
+    // a refusal that reports none has no such property: nothing is filled in on its behalf
+    const quiet = await runResearch(
+      CONFIG,
+      [
+        {
+          name: 'quiescence',
+          run: async () => ({ kind: 'refused', why: 'no baseline was taken' }),
+        },
+      ],
+      fakeFs().fs,
+    );
+    expect(quiet.phases[0]).toEqual({
+      ...AT,
+      name: 'quiescence',
+      status: 'refused',
+      why: 'no baseline was taken',
+    });
+    expect('evidence' in (quiet.phases[0] as object)).toBe(false);
+    expect(JSON.parse(written[path] ?? '')).toMatchObject({
+      phases: [
+        {
+          name: 'quiescence',
+          status: 'refused',
+          evidence: { rows: { total: 2, zone: { transcript: 2, configuration: 0 } } },
+        },
+        { name: 'later', status: 'not_run' },
+      ],
+    });
+  });
+
   it.each([
     [
       'refuses',

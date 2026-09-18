@@ -55,8 +55,9 @@ export interface PhaseContext {
 
 /** A phase either completes with evidence, or refuses to let the run continue. Throwing is failure. */
 export type PhaseResult =
+  /** `evidence` is structure the phase established; a refusal may carry it too. */
   | { readonly kind: 'completed'; readonly evidence?: unknown }
-  | { readonly kind: 'refused'; readonly why: string };
+  | { readonly kind: 'refused'; readonly why: string; readonly evidence?: unknown };
 
 export interface Phase {
   readonly name: string;
@@ -81,6 +82,8 @@ export type PhaseRecord =
       readonly name: string;
       readonly status: 'refused' | 'failed' | 'timed_out';
       readonly why: string;
+      /** Only a refusing phase supplies this; nothing is filled in on its behalf. */
+      readonly evidence?: unknown;
     })
   | { readonly name: string; readonly status: 'not_run'; readonly why: string };
 
@@ -242,7 +245,13 @@ export const runResearch = async (
             status: 'completed',
             ...(run.value.evidence === undefined ? {} : { evidence: run.value.evidence }),
           }
-        : { ...at, name: phase.name, status: 'refused', why: run.value.why }
+        : {
+            ...at,
+            name: phase.name,
+            status: 'refused',
+            why: run.value.why,
+            ...(run.value.evidence === undefined ? {} : { evidence: run.value.evidence }),
+          }
       : 'error' in run
         ? { ...at, name: phase.name, status: 'failed', why: text(run.error) }
         : {
