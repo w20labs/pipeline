@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { acquireLockBounded, releaseLockBounded } from '../src/lock.js';
 import type { LockDeps } from '../src/lock-phase.js';
 import { researchRun, type RunContext } from '../src/research-run.js';
+import { SNAPSHOT_CAP } from '../src/snapshot-phase.js';
 import type { Phase, RunConfig, RunnerFs, RunResult } from '../src/runner.js';
 import type { Snapshot } from '../src/snapshot.js';
 
@@ -25,6 +26,8 @@ import type { Snapshot } from '../src/snapshot.js';
 
 interface Tracked {
   readonly child: ChildProcess;
+  /** What it was asked to run, so a test can say which helper a child was. */
+  readonly argv: readonly string[];
   readonly kills: string[];
   exit?: { code: number | null; signal: NodeJS.Signals | null };
   error?: Error;
@@ -73,7 +76,7 @@ const observed = <T>(work: Promise<T>) => {
 
 const trackingSpawn = ((command: string, args: string[], options: object) => {
   const child = spawn(command, args, options);
-  const t: Tracked = { child, kills: [] };
+  const t: Tracked = { child, argv: [...args], kills: [] };
   tracked.push(t);
   child.once('exit', (code, signal) => (t.exit = { code, signal }));
   child.once('error', (error) => (t.error = error));
@@ -1522,5 +1525,165 @@ describe('a composed run', () => {
     } finally {
       process.off('unhandledRejection', watch);
     }
+  }, 60_000);
+
+  it('reports a directory the walk could not list, keeping what it did see', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    mkdirSync(join(at.research, 'closed'));
+    writeFileSync(join(at.research, 'closed', 'inside.txt'), 'hidden\n');
+    writeFileSync(join(at.research, 'open.txt'), 'seen\n');
+    // the real helper, with one directory made unlistable by its own device and inode, so the
+    // fault lands the same way whatever user runs this
+    const shim = join(at.scratch, 'blind-python');
+    writeFileSync(
+      shim,
+      [
+        '#!/usr/bin/env python3',
+        'import os, runpy, sys',
+        "if sys.argv[1].endswith('snapshot-tree.py'):",
+        `    target = os.stat(${JSON.stringify(join(at.research, 'closed'))})`,
+        '    real_scandir = os.scandir',
+        '    def scandir(fd):',
+        '        seen = os.fstat(fd)',
+        '        if (seen.st_dev, seen.st_ino) == (target.st_dev, target.st_ino):',
+        '            raise PermissionError(13, "Permission denied")',
+        '        return real_scandir(fd)',
+        '    os.scandir = scandir',
+        '    os.supports_fd = set(os.supports_fd) | {scandir}',
+        'sys.argv = sys.argv[1:]',
+        'runpy.run_path(sys.argv[0], run_name="__main__")',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    let context: RunContext | undefined;
+
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      python: shim,
+      after: (given) => ((context = given), []),
+    });
+
+    expect(result.outcome).toMatchObject({ name: 'snapshot', status: 'refused' });
+    expect((result.outcome as { why: string }).why).toBe(
+      'the baseline snapshot is incomplete; diagnostics: cannot list ×1',
+    );
+    const baseline = context?.baseline();
+    expect(baseline?.complete).toBe(false);
+    const paths = baseline?.entries.map((e) => e.path) ?? [];
+    expect(paths).toContain('open.txt'); // what it could read is kept
+    expect(paths).toContain('closed'); // the directory itself was seen
+    expect(paths).not.toContain('closed/inside.txt'); // its contents were never listed
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+  }, 60_000);
+
+  it('reports a root the walk could not open at all', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    rmSync(at.research, { recursive: true, force: true }); // the tree named by the configuration
+    let context: RunContext | undefined;
+
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      after: (given) => ((context = given), []),
+    });
+
+    expect((result.outcome as { why: string }).why).toBe(
+      'the baseline snapshot is incomplete; diagnostics: cannot open root ×1',
+    );
+    expect(context?.baseline()).toMatchObject({ complete: false, entries: [], problems: [] });
+    expect(result.cleanupDiagnostics).toEqual([]); // the lock still went back
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+  }, 60_000);
+
+  it('dispatches the walk with the bounds the phase owns', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const argv = join(at.scratch, 'argv');
+    const shim = join(at.scratch, 'recording-python');
+    writeFileSync(
+      shim,
+      ['#!/bin/sh', `printf '%s\\n' "$*" >> ${JSON.stringify(argv)}`, 'exec python3 "$@"', ''].join(
+        '\n',
+      ),
+      { mode: 0o755 },
+    );
+
+    const result = await researchRun(configOf(at), { spawn: trackingSpawn, python: shim });
+
+    expect(result.outcome).toEqual({ kind: 'completed' });
+    const walk = readFileSync(argv, 'utf8')
+      .split('\n')
+      .find((line) => line.includes('snapshot-tree.py'));
+    expect(walk).toContain(`--cap ${String(SNAPSHOT_CAP)}`); // the phase's own cap, not a caller's
+    expect(walk).toContain(`--root ${at.research}`);
+  }, 60_000);
+
+  it('leaves the walk unrun when the budget goes after the manifest, and still releases the lock', async () => {
+    const at = workspace();
+    const body = bootstrapManifest(at);
+    const BUDGET = 8_000;
+    const RESERVE = 4_000;
+    const origin = 4_000_000;
+    const clock = { t: origin };
+    let context: RunContext | undefined;
+    // the manifest's own child, identified by what it was asked to run. The clock moves on close,
+    // not exit: close is where its output is known complete. This listener is registered before
+    // runChild's, so it advances the clock, and runChild then records that same close event before
+    // any promise continuation runs — the reader still gets a whole stream, and the budget is spent
+    // by the time the loop considers the phase after it.
+    const watching = ((command: string, args: string[], options: object) => {
+      const child = trackingSpawn(command, args, options);
+      if (args.some((a) => a.endsWith('read-control-file.py')))
+        child.once('close', () => (clock.t = origin + BUDGET - RESERVE));
+      return child;
+    }) as unknown as typeof spawn;
+
+    const result = await researchRun(
+      configOf(at, { budgetMs: BUDGET, cleanupReserveMs: RESERVE }),
+      { spawn: watching, now: () => clock.t, after: (given) => ((context = given), []) },
+    );
+
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'completed'], // validated after the clock moved, so its work still counted
+      ['snapshot', 'not_run'],
+    ]);
+    expect(result.phases[2]).toMatchObject({ why: 'the run budget was spent' });
+    expect(context?.baseline()).toBeUndefined(); // no walk was started
+    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0, 0]); // acquire, manifest read, release
+    expect(tracked.some((t) => t.argv?.some((a) => a.endsWith('snapshot-tree.py')))).toBe(false);
+    expect(result.cleanupDiagnostics).toEqual([]); // released inside the reserve
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(body);
+  }, 60_000);
+
+  it('reports an interpreter that fails before the walk’s helper can run', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    // not the helper failing: the interpreter exits before it ever executes the walk
+    const shim = join(at.scratch, 'refusing-python');
+    writeFileSync(
+      shim,
+      ['#!/bin/sh', 'case "$1" in *snapshot-tree.py) exit 3 ;; esac', 'exec python3 "$@"', ''].join(
+        '\n',
+      ),
+      { mode: 0o755 },
+    );
+    let context: RunContext | undefined;
+
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      python: shim,
+      after: (given) => ((context = given), []),
+    });
+
+    expect((result.outcome as { why: string }).why).toBe(
+      'the baseline snapshot is incomplete (exited 3, the stream has no done)',
+    );
+    expect(context?.baseline()).toMatchObject({ complete: false, entries: [] });
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
   }, 60_000);
 });

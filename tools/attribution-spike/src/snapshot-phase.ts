@@ -201,14 +201,16 @@ export const snapshotPhase = (
       if (snapshot === FAILED) return refused('the baseline snapshot could not be taken');
       baseline = snapshot; // kept whole, even when the walk did not finish
       const diagnostics = counted(snapshot.helperDiagnostics);
-      if (!snapshot.complete)
+      if (!snapshot.complete) {
+        // an ordinary diagnostic ends a walk without any problem in the stream: say what there is
+        const named = listed(snapshot.problems);
+        const counts = diagnostics.map((d) => `${d.category} ×${String(d.count)}`).join(', ');
         return refused(
-          `the baseline snapshot is incomplete (${listed(snapshot.problems)})${
-            diagnostics.length === 0
-              ? ''
-              : `; diagnostics: ${diagnostics.map((d) => `${d.category} ×${String(d.count)}`).join(', ')}`
+          `the baseline snapshot is incomplete${named === '' ? '' : ` (${named})`}${
+            counts === '' ? '' : `; diagnostics: ${counts}`
           }`,
         );
+      }
       return {
         kind: 'completed',
         evidence: { root, entries: snapshot.entries.length, complete: true, diagnostics },
