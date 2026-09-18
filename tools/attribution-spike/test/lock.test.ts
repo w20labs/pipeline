@@ -9,6 +9,7 @@ import {
   type AcquireOutcome,
   LOCK_HELPER,
   LOCK_OUTPUT_BYTES,
+  type LockDiagnostic,
   type LockHandle,
   type LockOwner,
   prepareAcquire,
@@ -796,6 +797,248 @@ describe('taking the lock through the helper', () => {
       const handle = await acquired();
       const { outcome } = await release(handle, { stdout });
       expect(outcome).toEqual({ kind: 'unknown', problems, mayRemain: true });
+    });
+
+    /**
+     * Every reason and step the helper's release path may send. Listed here rather than imported,
+     * so the allowlists are pinned by this test and not by whatever the module happens to hold.
+     */
+    const RELEASE_REASONS = [
+      'arguments',
+      'capability',
+      'directory_missing',
+      'directory_unusable',
+      'lock_unusable',
+      'not_regular',
+      'fstat_failed',
+      'read_failed',
+      'too_large',
+      'stat_failed',
+      'unlink_failed',
+    ] as const;
+    const RELEASE_STEPS = [
+      'close_lock',
+      'close_directory',
+      'temp_unusable',
+      'temp_fstat_failed',
+      'temp_read_failed',
+      'temp_too_large',
+      'temp_partial',
+      'temp_unrecognized',
+      'temp_stat_failed',
+      'temp_replaced',
+      'temp_unlink_failed',
+      'temp_close_failed',
+    ] as const;
+
+    it.each([
+      ['missing', 'temp_partial', null],
+      ['not_ours', 'temp_unrecognized', null],
+      ['unrecognized', 'temp_close_failed', 'EBADF'],
+      ['replaced', 'temp_replaced', null],
+      ['released', 'temp_unlink_failed', 'EIO'],
+    ] as [string, string, string | null][])(
+      'passes %s through with the diagnostic it carried',
+      async (kind, step, errno) => {
+        const handle = await acquired();
+        const diagnostics = [{ step, errno }];
+        const { outcome } = await release(handle, { stdout: line({ kind, diagnostics }) });
+        expect(outcome).toEqual({ kind, diagnostics });
+      },
+    );
+
+    it.each([
+      ['an errno', 'unlink_failed', 'EPERM', []],
+      ['no errno', 'not_regular', null, []],
+      [
+        'a close failure beside it',
+        'lock_unusable',
+        'EIO',
+        [{ step: 'close_directory', errno: 'EBADF' }],
+      ],
+    ] as [string, string, string | null, { step: string; errno: string | null }[]][])(
+      'passes a refusal with %s through unchanged',
+      async (_label, reason, errno, diagnostics) => {
+        const handle = await acquired();
+        const { outcome } = await release(handle, {
+          stdout: line({ kind: 'refused', reason, errno, diagnostics }),
+        });
+        expect(outcome).toEqual({ kind: 'refused', reason, errno, diagnostics });
+      },
+    );
+
+    it.each(RELEASE_REASONS)('accepts %s as a reason', async (reason) => {
+      const handle = await acquired();
+      const { outcome } = await release(handle, {
+        stdout: line({ kind: 'refused', reason, errno: null, diagnostics: [] }),
+      });
+      // an allowlist missing this reason would report unknown instead
+      expect(outcome).toEqual({ kind: 'refused', reason, errno: null, diagnostics: [] });
+    });
+
+    it.each(RELEASE_STEPS)('accepts %s as a diagnostic step', async (step) => {
+      const handle = await acquired();
+      const diagnostics = [{ step, errno: 'EIO' }];
+      const { outcome } = await release(handle, {
+        stdout: line({ kind: 'released', diagnostics }),
+      });
+      expect(outcome).toEqual({ kind: 'released', diagnostics });
+    });
+
+    it('keeps several diagnostics in the order the helper reported them', async () => {
+      const handle = await acquired();
+      const diagnostics = [
+        { step: 'temp_stat_failed', errno: 'EIO' },
+        { step: 'close_lock', errno: null },
+        { step: 'temp_stat_failed', errno: 'EPERM' },
+        { step: 'close_directory', errno: 'EBADF' },
+      ];
+      const { outcome } = await release(handle, {
+        stdout: line({ kind: 'not_ours', diagnostics }),
+      });
+      if (outcome.kind !== 'not_ours') throw new Error(outcome.kind);
+      // order, repeats and each errno: the same sequence, not a set of steps
+      expect(outcome.diagnostics).toEqual(diagnostics);
+      expect(outcome.diagnostics.map((d) => `${d.step}:${String(d.errno)}`)).toEqual(
+        diagnostics.map((d) => `${d.step}:${String(d.errno)}`),
+      );
+    });
+
+    it('hands back an outcome nothing can change afterwards', async () => {
+      const handle = await acquired();
+      const diagnostics = [
+        { step: 'temp_replaced', errno: null },
+        { step: 'close_lock', errno: 'EBADF' },
+      ];
+      const { outcome } = await release(handle, {
+        stdout: line({ kind: 'released', diagnostics }),
+      });
+      if (outcome.kind !== 'released') throw new Error(outcome.kind);
+      expect(Object.isFrozen(outcome)).toBe(true);
+      expect(Object.isFrozen(outcome.diagnostics)).toBe(true);
+      for (const entry of outcome.diagnostics) expect(Object.isFrozen(entry)).toBe(true);
+      const mutable = outcome.diagnostics as LockDiagnostic[];
+      expect(() => mutable.push({ step: 'close_lock', errno: null })).toThrow(TypeError);
+      expect(() => ((mutable[0] as { step: string }).step = 'temp_partial')).toThrow(TypeError);
+      expect(outcome.diagnostics).toEqual(diagnostics); // every attempt refused, nothing moved
+    });
+
+    const refusal = (over: Record<string, unknown>) =>
+      line({ kind: 'refused', reason: 'unlink_failed', errno: null, diagnostics: [], ...over });
+    const carrying = (diagnostics: unknown) => line({ kind: 'released', diagnostics });
+
+    it.each([
+      ['no output at all', '', 'the output is not exactly one line'],
+      [
+        'a line without its newline',
+        JSON.stringify({ kind: 'released', diagnostics: [] }),
+        'the output is not exactly one line',
+      ],
+      ['text that is not JSON', 'not json\n', 'the output is not JSON'],
+      ['null', 'null\n', 'the output is not an object'],
+      ['an array', '[]\n', 'the output is not an object'],
+      ['a number', '7\n', 'the output is not an object'],
+      ['a string', '"released"\n', 'the output is not an object'],
+      [
+        'a kind inherited from Object',
+        line({ kind: 'toString', diagnostics: [] }),
+        'kind is unknown',
+      ],
+      ['a non-string kind', line({ kind: 7, diagnostics: [] }), 'kind is unknown'],
+      [
+        'released with an extra field',
+        line({ kind: 'released', diagnostics: [], errno: null }),
+        'the released result has the wrong fields',
+      ],
+      [
+        'missing carrying a reason',
+        line({ kind: 'missing', reason: 'not_regular', diagnostics: [] }),
+        'the missing result has the wrong fields',
+      ],
+      [
+        'replaced without its diagnostics',
+        line({ kind: 'replaced' }),
+        'the replaced result has the wrong fields',
+      ],
+      [
+        'refused without its errno',
+        line({ kind: 'refused', reason: 'not_regular', diagnostics: [] }),
+        'the refused result has the wrong fields',
+      ],
+      ['an unknown reason', refusal({ reason: 'confused' }), 'reason is unknown'],
+      ['a null reason', refusal({ reason: null }), 'reason is unknown'],
+      // the acquire side's own reason and step: the release tables are not that set
+      [
+        'a reason only acquisition can give',
+        refusal({ reason: 'link_failed' }),
+        'reason is unknown',
+      ],
+      [
+        'a step only acquisition can report',
+        carrying([{ step: 'unlink_temp', errno: null }]),
+        'diagnostics are malformed',
+      ],
+      ['a lowercase errno', refusal({ reason: 'stat_failed', errno: 'eio' }), 'errno is malformed'],
+      [
+        'an errno with trailing text',
+        refusal({ reason: 'stat_failed', errno: 'EIO now' }),
+        'errno is malformed',
+      ],
+      ['a numeric errno', refusal({ reason: 'stat_failed', errno: 5 }), 'errno is malformed'],
+      ['diagnostics that are not an array', carrying({}), 'diagnostics are malformed'],
+      ['a null diagnostic', carrying([null]), 'diagnostics are malformed'],
+      [
+        'a diagnostic with an extra key',
+        carrying([{ step: 'close_lock', errno: null, why: 'x' }]),
+        'diagnostics are malformed',
+      ],
+      [
+        'a diagnostic missing its errno',
+        carrying([{ step: 'close_lock' }]),
+        'diagnostics are malformed',
+      ],
+      [
+        'a diagnostic step inherited from Object',
+        carrying([{ step: 'toString', errno: null }]),
+        'diagnostics are malformed',
+      ],
+      ['an unknown step', carrying([{ step: 'nope', errno: null }]), 'diagnostics are malformed'],
+      ['a non-string step', carrying([{ step: 7, errno: null }]), 'diagnostics are malformed'],
+      [
+        'a diagnostic with a lowercase errno',
+        carrying([{ step: 'close_lock', errno: 'ebadf' }]),
+        'diagnostics are malformed',
+      ],
+      [
+        'a diagnostic with a numeric errno',
+        carrying([{ step: 'close_lock', errno: 5 }]),
+        'diagnostics are malformed',
+      ],
+      [
+        'a second diagnostic that is malformed',
+        carrying([
+          { step: 'close_lock', errno: null },
+          { step: 'nope', errno: null },
+        ]),
+        'diagnostics are malformed',
+      ],
+    ])('reports unknown for %s, saying the lock may remain', async (_label, stdout, problem) => {
+      const handle = await acquired();
+      const { outcome } = await release(handle, { stdout });
+      expect(outcome).toEqual({ kind: 'unknown', problems: [problem], mayRemain: true });
+    });
+
+    it.each([
+      ['an array-valued reason', refusal({ reason: ['unlink_failed'] })],
+      ['a numeric reason', refusal({ reason: 7 })],
+    ])('reports unknown for %s, which only looks like one', async (_label, stdout) => {
+      const handle = await acquired();
+      const { outcome } = await release(handle, { stdout });
+      expect(outcome).toEqual({
+        kind: 'unknown',
+        problems: ['reason is unknown'],
+        mayRemain: true,
+      });
     });
 
     it('never repeats what a failed release said', async () => {
