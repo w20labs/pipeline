@@ -519,6 +519,26 @@ describe('taking the lock through the helper', () => {
       expect(run.helper.signals).toEqual(['SIGTERM', 'SIGKILL']);
     });
 
+    it('carves the lock’s own grace windows out of the acquisition budget', async () => {
+      const run = await clocked({ stdout: ACQUIRED, end: 'never' });
+      const waiting = 10_000 - LOCK_TERM_GRACE_MS - LOCK_KILL_GRACE_MS;
+      await vi.advanceTimersByTimeAsync(waiting - 1);
+      expect(run.helper.signals).toEqual([]); // both graces come out of the one budget
+      await vi.advanceTimersByTimeAsync(1);
+      expect(run.helper.signals).toEqual(['SIGTERM']);
+      await vi.advanceTimersByTimeAsync(LOCK_TERM_GRACE_MS - 1);
+      expect(run.helper.signals).toEqual(['SIGTERM']);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(run.helper.signals).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(run.settled()).toBeUndefined(); // SIGKILL's own grace is still to come
+      await vi.advanceTimersByTimeAsync(LOCK_KILL_GRACE_MS); // through settlement: nothing left pending
+      expect(run.settled()).toEqual({
+        kind: 'unknown',
+        handle: { controlDir: DIR, runId: 'run-1' },
+        problems: ['ended early', 'signalled to stop'],
+      });
+    });
+
     it('gives up on a helper that exited without closing its streams', async () => {
       const run = await clocked({ stdout: ACQUIRED, end: 'exit-only' });
       await vi.advanceTimersByTimeAsync(10_000);
@@ -1096,6 +1116,13 @@ describe('taking the lock through the helper', () => {
         expect(run.helper.signals).toEqual(['SIGTERM']);
         await vi.advanceTimersByTimeAsync(1);
         expect(run.helper.signals).toEqual(['SIGTERM', 'SIGKILL']);
+        expect(run.settled()).toBeUndefined(); // SIGKILL's own grace is still to come
+        await vi.advanceTimersByTimeAsync(LOCK_KILL_GRACE_MS); // through settlement
+        expect(run.settled()).toEqual({
+          kind: 'unknown',
+          problems: ['ended early', 'signalled to stop'],
+          mayRemain: true,
+        });
       });
 
       it('will not try again after a release that never ended', async () => {
