@@ -204,6 +204,26 @@ describe('the research run skeleton', () => {
     });
   });
 
+  it('ends the summary with the document and exactly one newline', async () => {
+    clocked();
+    const { fs, written } = fakeFs();
+    const path = '/cache/research/runs/run-1/run.json';
+    const r = await runResearch(CONFIG, [{ name: 'quiet', run: done() }], fs);
+    expect(r.summary).toEqual({ written: true, path });
+    const text = written[path] ?? '';
+    // the framing, which parsing cannot see: one newline, never none and never two
+    expect(text.match(/\n*$/)?.[0]).toBe('\n');
+    // and what it frames is still the whole document, so the framing cannot be met by junk
+    expect(JSON.parse(text)).toEqual({
+      runId: 'run-1',
+      budgetMs: 10_000,
+      cleanupReserveMs: 2_000,
+      outcome: { kind: 'completed' },
+      phases: [{ ...AT, name: 'quiet', status: 'completed' }],
+      cleanupDiagnostics: [],
+    });
+  });
+
   it('keeps evidence a refusing phase reported, and invents none when it reports one', async () => {
     clocked();
     const { fs, written } = fakeFs();
