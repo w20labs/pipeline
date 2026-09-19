@@ -88,11 +88,18 @@ const settle = (unconfirmed: readonly string[], created: readonly string[]) => {
   for (const dir of created) rmSync(dir, { recursive: true, force: true });
 };
 
-afterEach(async () => {
-  const [owned, created] = [groups, dirs];
-  [groups, dirs] = [[], []];
-  settle(await reap(owned), created);
-}, 30_000);
+/**
+ * The whole teardown, in one place: claim what this test registered, end it, and decide what
+ * happens to the directories. `afterEach` runs exactly this and nothing else, so the step that
+ * carries an unconfirmed reap into settlement is somewhere a test can drive it.
+ */
+const teardown = async (probe?: (pid: number) => Presence, send?: Kill) => {
+  const [owned, created] = [groups, dirs]; // claimed before the await: whatever registers while
+  [groups, dirs] = [[], []]; // the reaping runs belongs to the next teardown, not to this one
+  settle(await reap(owned, probe, send), created);
+};
+
+afterEach(() => teardown(), 30_000); // called, never passed: a hook argument is not a probe
 
 /** A signal-0 stub that fails the way the operating system would. */
 const errs =
@@ -258,5 +265,55 @@ describe('the built package', () => {
     const unconfirmed = await reap([{ pid: 4_242 }, { pid: 4_243 }], probe, send);
     expect(signalled).toEqual([-4_242, -4_243]); // the second group was signalled all the same
     expect(unconfirmed).toEqual(['group 4242: unconfirmed']); // and the first is still reported
+  }, 30_000);
+
+  /**
+   * The registries hold fabricated pids for the two tests below. Both remove theirs in `finally`,
+   * whatever the assertions did: `afterEach` signals what it finds, and a number that belongs to no
+   * process of this test's must never be what it finds.
+   */
+  const forget = (...fabricated: number[]) => {
+    groups = groups.filter((group) => !fabricated.includes(group.pid));
+  };
+
+  it('carries an unconfirmed reap into settlement, keeping and naming the directory', async () => {
+    const kept = scratch('wiring-kept');
+    groups.push({ pid: 4_242 }); // a number, not a process: the injected send reaches nothing real
+    const signalled: number[] = [];
+    const send: Kill = (target) => {
+      signalled.push(target);
+      // registered while the reaping runs, so where it lands says which registry teardown claimed
+      if (!groups.some((group) => group.pid === 4_244)) groups.push({ pid: 4_244 });
+    };
+    try {
+      await expect(teardown(() => 'unconfirmed', send)).rejects.toThrow(
+        `termination unconfirmed; kept ${kept}: group 4242: unconfirmed`,
+      );
+      expect(existsSync(kept)).toBe(true); // what the failure named is still there to look at
+      expect(signalled).toEqual([-4_242]); // the owned group, and only it, reached the real reap
+      expect(dirs).toEqual([]); // the originals were claimed before the await, and the marker
+      expect(groups.map((group) => group.pid)).toEqual([4_244]); // went to the registry left behind
+    } finally {
+      forget(4_242, 4_244);
+      rmSync(kept, { recursive: true, force: true }); // this fixture is the test's own to clean up
+    }
+  }, 30_000);
+
+  it('removes the registered directory once the reap confirms there is nothing left', async () => {
+    const gone = scratch('wiring-gone');
+    groups.push({ pid: 4_243 });
+    const signalled: number[] = [];
+    try {
+      await teardown(
+        () => 'gone',
+        (target) => void signalled.push(target),
+      );
+      expect(existsSync(gone)).toBe(false); // settle was given the registry, not an empty list
+      expect(signalled).toEqual([-4_243]);
+      expect([groups, dirs]).toEqual([[], []]); // nothing registered after the claim, so both empty
+    } finally {
+      forget(4_243);
+      rmSync(gone, { recursive: true, force: true }); // already gone above; kept if an assertion threw
+    }
   }, 30_000);
 });
