@@ -1948,4 +1948,118 @@ describe('a composed run', () => {
     expect(result.cleanupDiagnostics).toEqual([]); // released inside the reserve
     expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(manifest);
   }, 60_000);
+
+  it('rehearses a whole pre-launch run offline, and leaves exactly its summary behind', async () => {
+    const at = workspace();
+    const manifest = bootstrapManifest(at);
+    // a small research tree of known shape: what the walk reports is what is here
+    mkdirSync(join(at.research, 'projects'));
+    const tree = {
+      'notes.txt': 'kept as written\n',
+      'settings.json': '{"cohort":"fictitious"}\n',
+      'projects/a.jsonl': '{"turn":1}\n',
+    };
+    for (const [path, body] of Object.entries(tree)) writeFileSync(join(at.research, path), body);
+    const entries = ['notes.txt', 'projects', 'projects/a.jsonl', 'settings.json'];
+
+    // no injected phases, no injected wrappers, no clock: only the spawn this test accounts for
+    const result = await researchRun(configOf(at), { spawn: trackingSpawn });
+
+    expect(result.outcome).toEqual({ kind: 'completed' });
+    expect(result.summary).toEqual({ written: true, path: join(at.runs, 'run-1', 'run.json') });
+
+    // the summary as written, field by field, with nothing unexpected in it
+    const written = JSON.parse(readFileSync(join(at.runs, 'run-1', 'run.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(written).sort()).toEqual([
+      'budgetMs',
+      'cleanupDiagnostics',
+      'cleanupReserveMs',
+      'outcome',
+      'phases',
+      'runId',
+    ]);
+    expect([written.runId, written.budgetMs, written.cleanupReserveMs]).toEqual([
+      'run-1',
+      30_000,
+      10_000,
+    ]);
+    expect(written.outcome).toEqual({ kind: 'completed' });
+    expect(written.cleanupDiagnostics).toEqual([]);
+
+    const phases = written.phases as Record<string, unknown>[];
+    expect(phases.map((p) => [p.name, p.status])).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'completed'],
+      ['snapshot', 'completed'],
+      ['quiescence', 'completed'],
+    ]);
+    for (const phase of phases)
+      expect(Object.keys(phase).sort()).toEqual([
+        'endedAt',
+        'evidence',
+        'name',
+        'startedAt',
+        'status',
+      ]);
+    // timestamps by type and order, never by value
+    let previous = 0;
+    for (const phase of phases) {
+      const started = phase.startedAt as number;
+      const ended = phase.endedAt as number;
+      expect([typeof started, typeof ended]).toEqual(['number', 'number']);
+      expect(ended).toBeGreaterThanOrEqual(started);
+      expect(started).toBeGreaterThanOrEqual(previous);
+      previous = ended;
+    }
+    const none = { created: 0, deleted: 0, changed: 0, unconfirmed: 0 };
+    expect(phases.map((p) => p.evidence)).toEqual([
+      { controlDir: at.control, runId: 'run-1', diagnostics: [] },
+      {
+        claudeVersion: '2.1.0',
+        bootstrappedAt: '2026-09-17T08:00:00Z',
+        separateAuthorization: 'unknown',
+      },
+      { root: at.research, entries: entries.length, complete: true, diagnostics: [] },
+      {
+        root: at.research,
+        before: entries.length,
+        after: entries.length,
+        rows: { total: 0, zone: { transcript: none, configuration: none } },
+        second: { problems: [], diagnostics: [] },
+      },
+    ]);
+
+    // five children, each identified by what it was asked to do, each ending on its own
+    const asked = tracked.map((t) => {
+      // each helper named explicitly: anything else is reported as itself and fails the sequence
+      if (t.argv.some((a) => a.endsWith('lock-file.py')))
+        return `lock:${String(t.argv[t.argv.indexOf('--mode') + 1])}`;
+      if (t.argv.some((a) => a.endsWith('read-control-file.py'))) return 'manifest';
+      if (t.argv.some((a) => a.endsWith('snapshot-tree.py'))) return 'walk';
+      return `unknown: ${t.argv.join(' ')}`;
+    });
+    expect(asked).toEqual(['lock:acquire', 'manifest', 'walk', 'walk', 'lock:release']);
+    expect(tracked.map((t) => [t.exit?.code, t.exit?.signal, t.kills])).toEqual(
+      Array.from({ length: 5 }, () => [0, null, []]),
+    );
+
+    // the lock is gone and the manifest is not: the control directory says both
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(manifest);
+    // the summary is here now, before any teardown runs
+    expect(readdirSync(join(at.runs, 'run-1'))).toEqual(['run.json']);
+    // the tree it read is exactly as it was, and nothing was put anywhere else
+    for (const [path, body] of Object.entries(tree))
+      expect(readFileSync(join(at.research, path), 'utf8')).toBe(body);
+    expect(
+      readdirSync(at.research, { recursive: true })
+        .map((name) => String(name))
+        .sort(),
+    ).toEqual(entries);
+    expect([readdirSync(at.operator), readdirSync(at.scratch)]).toEqual([[], []]);
+    // the workspace itself goes only once afterEach confirms every child ended
+  }, 120_000);
 });
