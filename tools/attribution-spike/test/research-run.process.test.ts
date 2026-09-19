@@ -209,6 +209,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'],
       ['snapshot', 'completed'],
+      ['quiescence', 'completed'],
       ['observe', 'completed'],
     ]);
     expect(result.phases[0]).toMatchObject({
@@ -231,10 +232,12 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'],
       ['snapshot', 'completed'],
+      ['quiescence', 'completed'],
       ['observe', 'completed'],
     ]);
-    expect(tracked).toHaveLength(4); // acquisition, the manifest read, the walk, release
+    expect(tracked).toHaveLength(5); // acquisition, manifest read, two walks, release
     expect(tracked.map((t) => [t.exit?.code, t.kills])).toEqual([
+      [0, []],
       [0, []],
       [0, []],
       [0, []],
@@ -261,6 +264,7 @@ describe('a composed run', () => {
       ['lock', 'refused'],
       ['manifest', 'not_run'],
       ['snapshot', 'not_run'],
+      ['quiescence', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]); // nothing ran behind a lock this run does not hold
@@ -327,6 +331,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'],
       ['snapshot', 'completed'],
+      ['quiescence', 'completed'],
       ['first', 'completed'],
       ['second', 'completed'],
     ]);
@@ -338,7 +343,7 @@ describe('a composed run', () => {
     });
     expect(claimed).toEqual({
       outcome: { name: 'start', status: 'refused', why: 'a supplied phase may not be named lock' },
-      phases: ['lock', 'manifest', 'snapshot', 'lock'].map((name) => ({
+      phases: ['lock', 'manifest', 'snapshot', 'quiescence', 'lock'].map((name) => ({
         name,
         status: 'not_run',
         why: 'the run did not start',
@@ -399,6 +404,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'],
       ['snapshot', 'completed'],
+      ['quiescence', 'completed'],
       ['observe', 'completed'],
     ]);
     // the lock identified the run the snapshot named, in the directory it named
@@ -464,7 +470,7 @@ describe('a composed run', () => {
         why: 'the run budget was spent',
       });
       expect(existsSync(join(at.runs, 'run-1', 'run.json'))).toBe(false); // correctly unwritten
-      expect(tracked).toHaveLength(3); // acquisition, manifest read and walk; no release
+      expect(tracked).toHaveLength(4); // acquisition, manifest read, two walks; no release
       // the lock this run took is still there, which is exactly what the diagnostics say
       expect(JSON.parse(readFileSync(join(at.control, 'run.lock'), 'utf8'))).toMatchObject({
         runId: 'run-1',
@@ -558,11 +564,12 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'],
       ['snapshot', 'completed'],
+      ['quiescence', 'completed'],
     ]);
     expect(result.phases[0]).toMatchObject({ evidence: { runId: 'run-1', diagnostics: [] } });
     expect(result.cleanupDiagnostics).toEqual([]); // the release measured on it too
     // the interpreter, the spawn and this clock reached the manifest reader and the walk as well
-    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0, 0, 0]);
+    expect(tracked.map((t) => t.exit?.code)).toEqual([0, 0, 0, 0, 0]);
     expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
   }, 60_000);
 
@@ -735,7 +742,12 @@ describe('a composed run', () => {
       await untilReady('the composed run', () => run.state.done, 15_000);
       const result = await run.work;
 
-      expect(result.phases.map((p) => p.status)).toEqual(['timed_out', 'not_run', 'not_run']);
+      expect(result.phases.map((p) => p.status)).toEqual([
+        'timed_out',
+        'not_run',
+        'not_run',
+        'not_run',
+      ]);
       expect(result.cleanupDiagnostics).toEqual([]); // reconciled, then released
       expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
       expect(tracked).toHaveLength(2);
@@ -814,6 +826,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'], // validated against the path read the first time
       ['snapshot', 'completed'],
+      ['quiescence', 'completed'],
     ]);
     expect(ran).toEqual([]);
   }, 60_000);
@@ -1029,6 +1042,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'refused'],
       ['snapshot', 'not_run'],
+      ['quiescence', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]); // nothing supplied runs without a manifest
@@ -1063,6 +1077,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'refused'],
       ['snapshot', 'not_run'],
+      ['quiescence', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]);
@@ -1090,6 +1105,7 @@ describe('a composed run', () => {
       'lock',
       'manifest',
       'snapshot',
+      'quiescence',
       'manifest',
     ]);
     expect(ran).toEqual([]);
@@ -1112,8 +1128,8 @@ describe('a composed run', () => {
 
     expect(result.outcome).toEqual({ kind: 'completed' });
     // acquisition, the manifest read, the walk and the release all used the captured interpreter
-    expect(readFileSync(marker, 'utf8')).toBe('xxxx');
-    expect(tracked).toHaveLength(4);
+    expect(readFileSync(marker, 'utf8')).toBe('xxxxx');
+    expect(tracked).toHaveLength(5);
   }, 60_000);
 
   it('exhausts the phase budget after the lock, leaving the manifest and later work unrun', async () => {
@@ -1146,6 +1162,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'not_run'],
       ['snapshot', 'not_run'],
+      ['quiescence', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(result.phases[1]).toMatchObject({ why: 'the run budget was spent' });
@@ -1228,6 +1245,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'refused'],
       ['snapshot', 'not_run'],
+      ['quiescence', 'not_run'],
     ]);
     // the manifest child ignored SIGTERM and was killed; its own exit says so, independently
     expect(tracked).toHaveLength(3);
@@ -1294,6 +1312,7 @@ describe('a composed run', () => {
         'lock',
         'manifest',
         'snapshot',
+        'quiescence',
         'observe',
       ]);
       expect(result.phases[0]).toMatchObject({ evidence: { runId: 'run-1' } });
@@ -1366,7 +1385,12 @@ describe('a composed run', () => {
         why: 'the supplied phases could not be built',
       });
       expect(JSON.stringify(result)).not.toContain('SENTINEL');
-      expect(status(result).map(([name]) => name)).toEqual(['lock', 'manifest', 'snapshot']);
+      expect(status(result).map(([name]) => name)).toEqual([
+        'lock',
+        'manifest',
+        'snapshot',
+        'quiescence',
+      ]);
       expect(tracked).toEqual([]); // nothing was started
       expect(existsSync(join(at.runs, 'run-1'))).toBe(false);
       expect(readdirSync(at.control)).toEqual(['bootstrap.json']); // and nothing was touched
@@ -1483,6 +1507,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'],
       ['snapshot', 'refused'],
+      ['quiescence', 'not_run'],
       ['observe', 'not_run'],
     ]);
     expect(ran).toEqual([]); // supplied work never ran behind a baseline that was not established
@@ -1650,6 +1675,7 @@ describe('a composed run', () => {
       ['lock', 'completed'],
       ['manifest', 'completed'], // validated after the clock moved, so its work still counted
       ['snapshot', 'not_run'],
+      ['quiescence', 'not_run'],
     ]);
     expect(result.phases[2]).toMatchObject({ why: 'the run budget was spent' });
     expect(context?.baseline()).toBeUndefined(); // no walk was started
@@ -1685,5 +1711,241 @@ describe('a composed run', () => {
     expect(context?.baseline()).toMatchObject({ complete: false, entries: [] });
     expect(result.cleanupDiagnostics).toEqual([]);
     expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+  }, 60_000);
+
+  /**
+   * An interpreter that counts invocations of the walk in a file, so a shim can act on the second
+   * one only: both walks run the same helper, and the baseline must be left alone.
+   */
+  const secondWalkShim = (at: { scratch: string }, body: readonly string[]) => {
+    const counter = join(at.scratch, 'walks');
+    const shim = join(at.scratch, 'second-walk-python');
+    writeFileSync(
+      shim,
+      [
+        '#!/usr/bin/env python3',
+        'import os, runpy, sys',
+        "if sys.argv[1].endswith('snapshot-tree.py'):",
+        `    counter = ${JSON.stringify(counter)}`,
+        '    walks = (open(counter).read() if os.path.exists(counter) else "") + "x"',
+        '    open(counter, "w").write(walks)',
+        '    if len(walks) == 2:',
+        ...body.map((line) => `        ${line}`),
+        'sys.argv = sys.argv[1:]',
+        'runpy.run_path(sys.argv[0], run_name="__main__")',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    return { shim, walks: () => (existsSync(counter) ? readFileSync(counter, 'utf8').length : 0) };
+  };
+
+  it('completes when two consecutive walks find the tree unchanged', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    writeFileSync(join(at.research, 'settings.json'), '{"a":1}\n');
+    const seen: {
+      baseline?: unknown;
+      second?: unknown;
+      twice?: unknown;
+      compared?: unknown;
+      comparedAgain?: unknown;
+    } = {};
+
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      after: (context) => [
+        {
+          name: 'observe',
+          run: async () => {
+            seen.baseline = context.baseline();
+            seen.second = context.second();
+            seen.twice = context.second();
+            seen.compared = context.comparison();
+            seen.comparedAgain = context.comparison();
+            return { kind: 'completed' };
+          },
+        },
+      ],
+    });
+
+    expect(result.outcome).toEqual({ kind: 'completed' });
+    expect(result.phases[3]).toMatchObject({
+      name: 'quiescence',
+      status: 'completed',
+      evidence: {
+        root: at.research,
+        rows: {
+          total: 0,
+          zone: {
+            transcript: { created: 0, deleted: 0, changed: 0, unconfirmed: 0 },
+            configuration: { created: 0, deleted: 0, changed: 0, unconfirmed: 0 },
+          },
+        },
+      },
+    });
+    expect(seen.second).toBe(seen.twice); // the identical walk, not a copy per call
+    expect(seen.second).not.toBe(seen.baseline); // and not the baseline either
+    expect(seen.compared).toBeDefined(); // a comparison was made, and it is one object as well
+    expect(seen.compared).toBe(seen.comparedAgain);
+    expect((seen.compared as { rows: unknown[] }).rows).toEqual([]);
+    expect((seen.second as Snapshot).complete).toBe(true);
+    expect(tracked).toHaveLength(5);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+  }, 60_000);
+
+  it('refuses when a file grows between the walks, and says so in the summary', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const grows = join(at.research, 'settings.json');
+    writeFileSync(grows, '{"a":1}\n');
+    // deterministic: the file's size changes, whatever the filesystem's timestamp resolution
+    const { shim, walks } = secondWalkShim(at, [
+      `open(${JSON.stringify(grows)}, "a").write("padding that changes the size\\n")`,
+    ]);
+    let context: RunContext | undefined;
+
+    const result = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      python: shim,
+      after: (given) => ((context = given), [observing('observe', () => undefined, at.control)]),
+    });
+
+    expect(walks()).toBe(2); // both walks ran the same helper; only the second changed anything
+    expect(result.outcome).toMatchObject({ name: 'quiescence', status: 'refused' });
+    expect((result.outcome as { why: string }).why).toBe('the tree differs between the two walks');
+    const rows = context?.comparison()?.rows ?? [];
+    // the size row is the established one; whether the timestamp also moved is the filesystem's business
+    expect(rows.filter((r) => r.type === 'changed' && r.field === 'size')).toHaveLength(1);
+    expect(rows.every((r) => r.type === 'changed' && r.zone === 'configuration')).toBe(true);
+    const evidence = (
+      result.phases[3] as {
+        evidence: { rows: { total: number; zone: Record<string, Record<string, number>> } };
+      }
+    ).evidence;
+    expect(evidence.rows.total).toBe(rows.length);
+    expect(evidence.rows.zone.configuration?.changed).toBe(rows.length);
+    expect(evidence.rows.zone.transcript).toEqual({
+      created: 0,
+      deleted: 0,
+      changed: 0,
+      unconfirmed: 0,
+    });
+    // the same evidence reaches the written summary, not only the returned result
+    const summary = JSON.parse(
+      readFileSync(join(at.runs, 'run-1', 'run.json'), 'utf8'),
+    ) as RunResult;
+    expect(summary.phases[3]).toMatchObject({
+      status: 'refused',
+      why: 'the tree differs between the two walks',
+      evidence: {
+        root: at.research,
+        rows: {
+          total: rows.length,
+          zone: {
+            configuration: {
+              created: 0,
+              deleted: 0,
+              changed: rows.length, // every row is this file's, and every one is a change
+              unconfirmed: 0,
+            },
+            transcript: { created: 0, deleted: 0, changed: 0, unconfirmed: 0 },
+          },
+        },
+      },
+    });
+    expect(result.cleanupDiagnostics).toEqual([]);
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+  }, 60_000);
+
+  it('refuses when the second walk cannot finish, keeping the baseline it already had', async () => {
+    const at = workspace();
+    const manifest = bootstrapManifest(at);
+    writeFileSync(join(at.research, 'settings.json'), '{"a":1}\n');
+    const { shim, walks } = secondWalkShim(at, ['import time', 'time.sleep(3600)']);
+    const ran: string[] = [];
+    let context: RunContext | undefined;
+
+    const result = await researchRun(configOf(at, { budgetMs: 8_000, cleanupReserveMs: 4_000 }), {
+      spawn: trackingSpawn,
+      python: shim,
+      after: (given) => (
+        (context = given),
+        [observing('observe', () => ran.push('observe'), at.control)]
+      ),
+    });
+
+    expect(walks()).toBe(2);
+    expect(result.outcome).toMatchObject({ name: 'quiescence', status: 'refused' });
+    expect((result.outcome as { why: string }).why).toBe('the second walk is incomplete');
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'completed'],
+      ['snapshot', 'completed'],
+      ['quiescence', 'refused'],
+      ['observe', 'not_run'],
+    ]);
+    expect(ran).toEqual([]);
+    expect(context?.baseline()?.complete).toBe(true); // the first walk is untouched
+    expect(context?.second()?.complete).toBe(false); // the second is kept as far as it got
+    expect(result.cleanupDiagnostics).toEqual([]); // and the lock still went back
+    // said by the directory itself: the lock and its temporary file are gone, the manifest is not
+    expect(readdirSync(at.control)).toEqual(['bootstrap.json']);
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(manifest);
+  }, 60_000);
+
+  it('refuses a supplied phase that claims the quiescence name', async () => {
+    const at = workspace();
+    bootstrapManifest(at);
+    const claimed = await researchRun(configOf(at), {
+      spawn: trackingSpawn,
+      after: [observing('quiescence', () => undefined, at.control)],
+    });
+    expect(claimed.outcome).toEqual({
+      name: 'start',
+      status: 'refused',
+      why: 'a supplied phase may not be named quiescence',
+    });
+    expect(tracked).toEqual([]);
+    expect(existsSync(join(at.runs, 'run-1'))).toBe(false);
+  }, 60_000);
+
+  it('leaves the second walk unrun when the budget goes after the first', async () => {
+    const at = workspace();
+    const manifest = bootstrapManifest(at);
+    const BUDGET = 8_000;
+    const RESERVE = 4_000;
+    const origin = 5_000_000;
+    const clock = { t: origin };
+    let context: RunContext | undefined;
+    // on the first walk's close — its output is complete then, and this listener is registered
+    // before runChild's, so the clock moves before any promise continuation of the reader
+    const watching = ((command: string, args: string[], options: object) => {
+      const child = trackingSpawn(command, args, options);
+      if (args.some((a) => a.endsWith('snapshot-tree.py')))
+        child.once('close', () => (clock.t = origin + BUDGET - RESERVE));
+      return child;
+    }) as unknown as typeof spawn;
+
+    const result = await researchRun(
+      configOf(at, { budgetMs: BUDGET, cleanupReserveMs: RESERVE }),
+      { spawn: watching, now: () => clock.t, after: (given) => ((context = given), []) },
+    );
+
+    expect(status(result)).toEqual([
+      ['lock', 'completed'],
+      ['manifest', 'completed'],
+      ['snapshot', 'completed'],
+      ['quiescence', 'not_run'],
+    ]);
+    expect(result.phases[3]).toMatchObject({ why: 'the run budget was spent' });
+    expect(context?.baseline()?.complete).toBe(true);
+    expect(context?.second()).toBeUndefined();
+    expect(context?.comparison()).toBeUndefined();
+    expect(tracked.filter((t) => t.argv.some((a) => a.endsWith('snapshot-tree.py')))).toHaveLength(
+      1,
+    );
+    expect(result.cleanupDiagnostics).toEqual([]); // released inside the reserve
+    expect(readFileSync(join(at.control, 'bootstrap.json'), 'utf8')).toBe(manifest);
   }, 60_000);
 });

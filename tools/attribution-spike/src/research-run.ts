@@ -14,6 +14,8 @@ import type { spawn as nodeSpawn } from 'node:child_process';
 import { readControlFile } from './control-file.js';
 import { type LockDeps, lockPhase } from './lock-phase.js';
 import { manifestPhase } from './manifest.js';
+import { quiescencePhase } from './quiescence-phase.js';
+import type { SnapshotDiff } from './snapshot-diff.js';
 import { snapshotPhase } from './snapshot-phase.js';
 import type { Snapshot } from './snapshot.js';
 import type { LockOwner } from './lock.js';
@@ -26,12 +28,16 @@ import {
   runResearch,
 } from './runner.js';
 
-const RESERVED = ['lock', 'manifest', 'snapshot'] as const;
+const RESERVED = ['lock', 'manifest', 'snapshot', 'quiescence'] as const;
 
 /** What a supplied phase may ask the run about. Frozen, and answering from the phase that owns it. */
 export interface RunContext {
   /** The baseline exactly as taken — partial entries included — or `undefined` before the walk. */
   readonly baseline: () => Snapshot | undefined;
+  /** The second walk, once quiescence has taken one. */
+  readonly second: () => Snapshot | undefined;
+  /** What the two walks differed in, when they were compared at all. */
+  readonly comparison: () => SnapshotDiff | undefined;
 }
 /** Phases to run after the run's own, or a function given the context once, before the run starts. */
 export type SuppliedPhases = readonly Phase[] | ((context: RunContext) => readonly Phase[]);
@@ -182,9 +188,17 @@ export const researchRun = async (
     (dir, name, readOptions) => readControlFile(dir, name, { ...readOptions, ...bounds }),
   );
   const snapshot = snapshotPhase({ root: c.researchConfig }, bounds);
+  const quiescence = quiescencePhase(
+    { root: c.researchConfig, baseline: () => snapshot.taken() },
+    bounds,
+  );
 
   // caller code runs only now, with every input already captured, and exactly once
-  const context: RunContext = Object.freeze({ baseline: () => snapshot.taken() });
+  const context: RunContext = Object.freeze({
+    baseline: () => snapshot.taken(),
+    second: () => quiescence.taken(),
+    comparison: () => quiescence.comparison(),
+  });
   const after = supplyPhases(supplied, context);
   const built = RESERVED.map((name) => name);
   if (after === FAILED) return refusedBeforeStart(built, 'the supplied phases could not be built');
@@ -194,5 +208,5 @@ export const researchRun = async (
       [...built, ...after.map((p) => p.name)],
       `a supplied phase may not be named ${claimed.name}`,
     );
-  return runResearch(c, [lock, manifest, snapshot.phase, ...after], fs, now);
+  return runResearch(c, [lock, manifest, snapshot.phase, quiescence.phase, ...after], fs, now);
 };
